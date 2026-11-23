@@ -1,0 +1,6 @@
+{
+  "name": "SICEP — Control Integral de Inventarios y Punto de Venta",
+  "description": "Plataforma centralizada de control de inventarios, planificación inteligente de conteos, conciliación, auditoría y punto de venta para materiales de construcción.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
