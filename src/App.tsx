@@ -15,7 +15,6 @@ import {
   Menu,
   Printer,
   Shield,
-  ShoppingCart,
   X,
 } from 'lucide-react';
 import { AnalyticsAiView } from './components/AnalyticsAiView';
@@ -29,7 +28,6 @@ import { DashboardView } from './components/DashboardView';
 import { GoogleSheetsView } from './components/GoogleSheetsView';
 import { LocationsView } from './components/LocationsView';
 import { MasterCatalogView } from './components/MasterCatalogView';
-import { PosView } from './components/PosView';
 import { UsersAuditView } from './components/UsersAuditView';
 import { ValidationClosureView } from './components/ValidationClosureView';
 import { apiFetch, setAuthToken } from './lib/api';
@@ -46,7 +44,6 @@ type NavKey =
   | 'blind-sheet'
   | 'validation'
   | 'ai'
-  | 'pos'
   | 'sheets'
   | 'cloud'
   | 'users';
@@ -202,7 +199,7 @@ export default function App() {
     },
     {
       key: 'validation',
-      label: 'Validación y Ajustes',
+      label: 'Revisión y Aprobación',
       icon: <FileCheck2 className="w-4 h-4" />,
       roles: [UserRole.JEFE_STOCK],
     },
@@ -211,12 +208,6 @@ export default function App() {
       label: 'Inteligencia Analítica',
       icon: <BrainCircuit className="w-4 h-4" />,
       roles: [UserRole.JEFE_STOCK],
-    },
-    {
-      key: 'pos',
-      label: 'Punto de Venta (POS)',
-      icon: <ShoppingCart className="w-4 h-4" />,
-      roles: [UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO],
     },
     {
       key: 'sheets',
@@ -478,9 +469,6 @@ export default function App() {
             />
           )}
           {activeTab === 'ai' && currentUser.role === UserRole.JEFE_STOCK && <AnalyticsAiView />}
-          {activeTab === 'pos' && currentUser.role !== UserRole.CONTADOR && (
-            <PosView currentUser={currentUser} />
-          )}
           {activeTab === 'sheets' && currentUser.role !== UserRole.CONTADOR && (
             <GoogleSheetsView currentUser={currentUser} />
           )}

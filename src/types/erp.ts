@@ -28,14 +28,10 @@ export const RiskTier = {
 export type RiskTier = (typeof RiskTier)[keyof typeof RiskTier];
 
 export const CountStatus = {
-  BORRADOR: 'BORRADOR',
-  ASIGNADO: 'ASIGNADO',
-  EN_EJECUCION: 'EN_EJECUCION',
-  PENDIENTE_APROBACION: 'PENDIENTE_APROBACION',
-  RECHAZADO: 'RECHAZADO',
+  EJECUCION: 'EJECUCION',
+  ENTREGADO: 'ENTREGADO',
   APROBADO: 'APROBADO',
-  PENDIENTE_REGULARIZACION: 'PENDIENTE_REGULARIZACION',
-  CERRADO: 'CERRADO',
+  RECHAZADO: 'RECHAZADO',
 } as const;
 export type CountStatus = (typeof CountStatus)[keyof typeof CountStatus];
 
@@ -55,20 +51,6 @@ export const AdjustmentOperationType = {
 } as const;
 export type AdjustmentOperationType =
   (typeof AdjustmentOperationType)[keyof typeof AdjustmentOperationType];
-
-export const PosOperationType = {
-  VENTA: 'VENTA',
-  RESERVA: 'RESERVA',
-  DEVOLUCION: 'DEVOLUCION',
-} as const;
-export type PosOperationType = (typeof PosOperationType)[keyof typeof PosOperationType];
-
-export const PosOperationStatus = {
-  PENDIENTE: 'PENDIENTE',
-  CONFIRMADA: 'CONFIRMADA',
-  ANULADA: 'ANULADA',
-} as const;
-export type PosOperationStatus = (typeof PosOperationStatus)[keyof typeof PosOperationStatus];
 
 export interface AuthUser {
   id: number;
@@ -123,7 +105,6 @@ export interface ExcelColumnMapping {
   erpStock?: string;
   location?: string;
   costPrice?: string;
-  salePrice?: string;
   committedStock?: string;
   criticality?: string;
 }

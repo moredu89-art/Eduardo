@@ -23,7 +23,6 @@ interface BalanceItem {
   brand: string;
   unit_of_measure: string;
   cost_price: number | null;
-  sale_price: number | null;
   criticality_level: string;
   location_id: number;
   location_name: string;
@@ -31,7 +30,6 @@ interface BalanceItem {
   committed_stock: number;
   review_stock: number;
   damaged_stock: number;
-  pos_pending_sync: number;
   available_stock: number;
   last_erp_updated_at: string | null;
   last_counted_at: string | null;
@@ -46,13 +44,11 @@ interface ConsolidatedItem {
   brand: string;
   unit_of_measure: string;
   cost_price: number | null;
-  sale_price: number | null;
   locations_count: number;
   total_erp_physical: number;
   total_committed: number;
   total_review: number;
   total_damaged: number;
-  total_pos_pending: number;
   total_available: number;
   last_erp_sync_at: string | null;
 }
@@ -231,7 +227,6 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
         erpStock: data.suggestedMapping.erpStock || '',
         location: data.suggestedMapping.location || '',
         costPrice: data.suggestedMapping.costPrice || '',
-        salePrice: data.suggestedMapping.salePrice || '',
         committedStock: data.suggestedMapping.committedStock || '',
         criticality: data.suggestedMapping.criticality || '',
       });
@@ -324,9 +319,8 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
     { key: 'erpStock', label: 'Existencia ERP (opcional)' },
     { key: 'committedStock', label: 'Stock comprometido' },
     { key: 'costPrice', label: 'Costo unitario' },
-    { key: 'salePrice', label: 'Precio de venta' },
     { key: 'alias', label: 'Alias / Cód. alternativo' },
-    { key: 'criticality', label: 'Criticidad comercial' },
+    { key: 'criticality', label: 'Criticidad operativa' },
   ];
 
   return (
@@ -513,9 +507,8 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
                 <th className="py-2.5 px-3 text-right">ERP Físico</th>
                 <th className="py-2.5 px-3 text-right">Comprometido</th>
                 <th className="py-2.5 px-3 text-right">Revisión / Rotura</th>
-                <th className="py-2.5 px-3 text-right">POS Local</th>
                 <th className="py-2.5 px-3 text-right">Disponible</th>
-                <th className="py-2.5 px-3 text-right">Costo / PVP</th>
+                <th className="py-2.5 px-3 text-right">Costo</th>
                 <th className="py-2.5 px-3">Act. ERP</th>
                 {currentUser.role === UserRole.JEFE_STOCK && <th className="py-2.5 px-3">Acción</th>}
               </tr>
@@ -545,15 +538,11 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
                   <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
                     {row.review_stock} / {row.damaged_stock}
                   </td>
-                  <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
-                    {row.pos_pending_sync}
-                  </td>
                   <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-emerald-700">
                     {row.available_stock}
                   </td>
                   <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
-                    {row.cost_price !== null ? `$${row.cost_price}` : '—'} /{' '}
-                    {row.sale_price !== null ? `$${row.sale_price}` : '—'}
+                    {row.cost_price !== null ? `$${row.cost_price}` : '—'}
                   </td>
                   <td className="py-2.5 px-3 font-mono text-[11px] text-slate-500">
                     {row.last_erp_updated_at ? row.last_erp_updated_at.slice(0, 16).replace('T', ' ') : '—'}

@@ -69,7 +69,6 @@ const HEADER_SYNONYMS: Record<keyof ExcelColumnMapping, string[]> = {
   erpStock: ['existencia', 'stock', 'stock_fisico', 'existencia_erp', 'cantidad', 'saldo'],
   location: ['deposito', 'ubicacion', 'sucursal', 'almacen', 'bodega'],
   costPrice: ['costo', 'precio_costo', 'costo_unitario', 'cost'],
-  salePrice: ['precio', 'precio_venta', 'precio de venta', 'pvp', 'venta'],
   committedStock: ['comprometido', 'stock comprometido', 'reservado'],
   criticality: ['criticidad', 'prioridad'],
 };
@@ -103,7 +102,6 @@ function suggestMappingFromHeaders(headers: string[]): ExcelColumnMapping {
     erpStock: suggested.erpStock || '',
     location: suggested.location || '',
     costPrice: suggested.costPrice || '',
-    salePrice: suggested.salePrice || '',
     committedStock: suggested.committedStock || '',
     criticality: suggested.criticality || '',
   };
@@ -366,7 +364,6 @@ export const GoogleSheetsView: React.FC<{ currentUser: AuthUser }> = ({ currentU
         'Rotura',
         'Disponible',
         'Costo',
-        'Precio de venta',
       ];
       const rows = inv.items.map((it) => [
         String(it.sku || ''),
@@ -381,7 +378,6 @@ export const GoogleSheetsView: React.FC<{ currentUser: AuthUser }> = ({ currentU
         Number(it.damaged_stock || 0),
         Number(it.available_stock || 0),
         it.cost_price !== null && it.cost_price !== undefined ? Number(it.cost_price) : '',
-        it.sale_price !== null && it.sale_price !== undefined ? Number(it.sale_price) : '',
       ]);
       return [header, ...rows];
     }
@@ -398,7 +394,6 @@ export const GoogleSheetsView: React.FC<{ currentUser: AuthUser }> = ({ currentU
       'Stock Comprometido',
       'Disponible Total',
       'Costo',
-      'Precio de venta',
     ];
     const rows = inv.consolidated.map((c) => [
       String(c.sku || ''),
@@ -412,7 +407,6 @@ export const GoogleSheetsView: React.FC<{ currentUser: AuthUser }> = ({ currentU
       Number(c.total_committed || 0),
       Number(c.total_available || 0),
       c.cost_price !== null && c.cost_price !== undefined ? Number(c.cost_price) : '',
-      c.sale_price !== null && c.sale_price !== undefined ? Number(c.sale_price) : '',
     ]);
     return [header, ...rows];
   };
@@ -499,7 +493,6 @@ export const GoogleSheetsView: React.FC<{ currentUser: AuthUser }> = ({ currentU
     { key: 'erpStock', label: 'Existencia ERP (opcional)' },
     { key: 'committedStock', label: 'Stock comprometido' },
     { key: 'costPrice', label: 'Costo unitario' },
-    { key: 'salePrice', label: 'Precio de venta' },
     { key: 'alias', label: 'Alias' },
     { key: 'criticality', label: 'Criticidad' },
   ];

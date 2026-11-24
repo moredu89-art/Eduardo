@@ -148,8 +148,7 @@ service cloud.firestore {
         data.locationName is string && data.locationName.size() >= 1 && data.locationName.size() <= 120 &&
         data.scheduledDate is string && data.scheduledDate.size() >= 8 && data.scheduledDate.size() <= 32 &&
         data.status in [
-          'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
-          'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
+          'EJECUCION', 'ENTREGADO', 'APROBADO', 'RECHAZADO'
         ] &&
         data.itemsCount is int && data.itemsCount >= 0 &&
         data.discrepanciesCount is int && data.discrepanciesCount >= 0 &&
@@ -348,7 +347,7 @@ service cloud.firestore {
             isAdmin() ||
             (
               existing().ownerUid == request.auth.uid &&
-              existing().status != 'CERRADO' &&
+              existing().status != 'APROBADO' &&
               isWorkspaceOwner(workspaceId) &&
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'countNumber', 'locationName', 'scheduledDate',

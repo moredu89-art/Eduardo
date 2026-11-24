@@ -212,7 +212,7 @@ export const CountPlannerView: React.FC = () => {
       return;
     }
     if (!saveAsDraft && !manualCounterId) {
-      setError('Seleccione un responsable de conteo o guarde como Borrador.');
+      setError('Seleccione un responsable de conteo o elija Crear sin Asignar.');
       return;
     }
     try {
@@ -230,8 +230,8 @@ export const CountPlannerView: React.FC = () => {
       setSelectedProductIds([]);
       setMessage(
         saveAsDraft
-          ? `Conteo ${res.countNumber} creado en estado BORRADOR (pendiente de asignación).`
-          : `Conteo ciego ${res.countNumber} creado y asignado correctamente.`
+          ? `Conteo ${res.countNumber} creado en estado EJECUCIÓN (pendiente de asignación).`
+          : `Conteo ciego ${res.countNumber} creado en EJECUCIÓN y asignado correctamente.`
       );
       await loadAll();
     } catch (err: unknown) {
@@ -500,7 +500,7 @@ export const CountPlannerView: React.FC = () => {
                 disabled={selectedProductIds.length === 0}
                 className="px-3 py-1.5 text-xs font-medium border border-slate-300 text-slate-700 bg-slate-50 rounded-lg hover:bg-slate-100 disabled:opacity-50"
               >
-                Guardar Borrador ({selectedProductIds.length})
+                Crear sin Asignar ({selectedProductIds.length})
               </button>
             </div>
           </div>

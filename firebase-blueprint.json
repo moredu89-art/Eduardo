@@ -294,14 +294,10 @@
         "status": {
           "type": "string",
           "enum": [
-            "BORRADOR",
-            "ASIGNADO",
-            "EN_EJECUCION",
-            "PENDIENTE_APROBACION",
-            "RECHAZADO",
+            "EJECUCION",
+            "ENTREGADO",
             "APROBADO",
-            "PENDIENTE_REGULARIZACION",
-            "CERRADO"
+            "RECHAZADO"
           ]
         },
         "itemsCount": {

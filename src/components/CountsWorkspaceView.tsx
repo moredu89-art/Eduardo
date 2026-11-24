@@ -7,8 +7,8 @@ import {
   Download,
   FileSpreadsheet,
   Paperclip,
-  Play,
   Printer,
+  RotateCcw,
   Save,
   Send,
   ShieldAlert,
@@ -39,6 +39,7 @@ interface CountSummary {
   counter_signature_name: string;
   warehouse_signature_name: string;
   chief_signature_name: string;
+  attachments_count?: number;
 }
 
 interface CountItemDetail {
@@ -90,9 +91,9 @@ interface CountItemInputState {
   obs: string;
 }
 
-function isValidRequiredQty(raw: string): boolean {
+function isValidOptionalQty(raw: string): boolean {
   const trimmed = raw.trim();
-  if (trimmed === '') return false;
+  if (trimmed === '') return true;
   const num = Number(trimmed);
   return Number.isFinite(num) && num >= 0;
 }
@@ -151,7 +152,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
         submissions: res.submissions || [],
       });
 
-      const isRecount = res.count.status === CountStatus.RECHAZADO;
+      const isRecount = Boolean(res.count.rejected_at) || (res.submissions?.length || 0) > 0;
       const map: Record<number, CountItemInputState> = {};
       for (const it of res.items) {
         const bulkVal = isRecount ? it.recount_bulk_qty : it.bulk_qty;
@@ -199,19 +200,47 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
     loadCounts(initialCountId);
   }, [initialCountId]);
 
-  const handleStartCount = async () => {
+  const handleReopenCount = async () => {
     if (!detail) return;
     setError(null);
     setMessage(null);
     setSaving(true);
     try {
-      await apiFetch(`/api/counts/${detail.count.id}/start`, { method: 'POST' });
-      setMessage('Ejecución del conteo iniciada.');
+      await apiFetch(`/api/counts/${detail.count.id}/reopen`, { method: 'POST' });
+      setMessage('Conteo devuelto a estado EJECUCIÓN. Ya puede corregir cantidades y volver a entregar.');
       await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!detail) return;
+    setError(null);
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`/api/counts/${detail.count.id}/export-excel`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'No se pudo descargar la planilla Excel');
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Planilla_Conteo_${String(detail.count.count_number || detail.count.id)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      setMessage(`Planilla Excel ciega descargada (${String(detail.count.count_number)}).`);
+      await loadCounts(Number(detail.count.id));
+    } catch (err: unknown) {
+      setError((err as Error).message);
     }
   };
 
@@ -366,17 +395,23 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
               missingReason: entry.notCountedReason.trim() === '',
             };
           }
-          const missingBulk = !isValidRequiredQty(entry.bulkQty);
-          const missingLoose = !isValidRequiredQty(entry.looseQty);
+          const bulkProvided = entry.bulkQty.trim() !== '';
+          const looseProvided = entry.looseQty.trim() !== '';
+          const bulkValidOpt = isValidOptionalQty(entry.bulkQty);
+          const looseValidOpt = isValidOptionalQty(entry.looseQty);
+          const missingAnyQty = !bulkProvided && !looseProvided;
+          const invalidBulk = !bulkValidOpt;
+          const invalidLoose = !looseValidOpt;
           return {
             id: it.id,
             sku: it.sku,
-            missingBulk,
-            missingLoose,
+            missingAnyQty,
+            invalidBulk,
+            invalidLoose,
             missingReason: false,
           };
         })
-        .filter((x) => x.missingBulk || x.missingLoose || x.missingReason)
+        .filter((x) => x.missingAnyQty || x.invalidBulk || x.invalidLoose || x.missingReason)
     : [];
 
   const totalAttachmentsCount = detail
@@ -390,9 +425,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
   const hasCounterSignature = counterSig.trim().length > 0;
   const hasGeneralObservations = generalObservations.trim().length > 0;
   const isExecutionStageForPresent = Boolean(
-    detail &&
-      (detail.count.status === CountStatus.EN_EJECUCION ||
-        detail.count.status === CountStatus.RECHAZADO)
+    detail && detail.count.status === CountStatus.EJECUCION
   );
 
   const handleSaveOrPresent = async (presentForApproval: boolean) => {
@@ -404,7 +437,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
       setValidationAttempted(true);
       if (!isExecutionStageForPresent) {
         setError(
-          'Debe iniciar primero la ejecución del conteo (botón "Iniciar Conteo") antes de presentarlo para revisión.'
+          'El conteo debe encontrarse en estado EJECUCIÓN para poder presentarlo para revisión.'
         );
         return;
       }
@@ -413,9 +446,10 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
           .slice(0, 4)
           .map((x) => {
             if (x.missingReason) return `${x.sku} (Justificación de no conteo)`;
+            if (x.missingAnyQty) return `${x.sku} (Ingrese cantidad, puede ser 0)`;
             const cols = [
-              x.missingBulk ? 'Unidades/Bultos' : '',
-              x.missingLoose ? 'Unidades Sueltas' : '',
+              x.invalidBulk ? 'Unidades/Bultos inválidas' : '',
+              x.invalidLoose ? 'Unidades Sueltas inválidas' : '',
             ]
               .filter(Boolean)
               .join(' y ');
@@ -423,7 +457,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
           })
           .join(', ');
         setError(
-          `No se puede presentar el conteo: todos los artículos deben tener resultado físico completo o justificación de no conteo. Pendientes (${incompleteItems.length}): ${previewSkus}${
+          `No se puede presentar el conteo: todos los artículos deben tener resultado físico (puede ser 0) o justificación de no conteo. Pendientes (${incompleteItems.length}): ${previewSkus}${
             incompleteItems.length > 4 ? '...' : ''
           }.`
         );
@@ -443,12 +477,6 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
         setError('Debe completar las observaciones generales obligatorias del conteo.');
         return;
       }
-      if (totalAttachmentsCount === 0) {
-        setError(
-          'Debe adjuntar al menos una planilla firmada o documento respaldatorio antes de presentar el conteo.'
-        );
-        return;
-      }
     }
 
     // Validate numeric inputs when provided on non-skipped items
@@ -461,14 +489,14 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
         obs: '',
       };
       if (entry.isNotCounted) continue;
-      if (entry.bulkQty.trim() !== '' && !isValidRequiredQty(entry.bulkQty)) {
+      if (!isValidOptionalQty(entry.bulkQty)) {
         setValidationAttempted(true);
         setError(
           `El valor de "Unidades / Bultos" en ${it.sku} debe ser un número válido mayor o igual a 0.`
         );
         return;
       }
-      if (entry.looseQty.trim() !== '' && !isValidRequiredQty(entry.looseQty)) {
+      if (!isValidOptionalQty(entry.looseQty)) {
         setValidationAttempted(true);
         setError(
           `El valor de "Unidades Sueltas" en ${it.sku} debe ser un número válido mayor o igual a 0.`
@@ -498,10 +526,13 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
             observations: entry.obs ?? '',
           };
         }
-        const bulk = entry.bulkQty.trim() === '' ? null : Number(entry.bulkQty);
-        const loose = entry.looseQty.trim() === '' ? null : Number(entry.looseQty);
+        const hasAny = entry.bulkQty.trim() !== '' || entry.looseQty.trim() !== '';
+        const bulk = entry.bulkQty.trim() === '' ? (hasAny ? 0 : null) : Number(entry.bulkQty);
+        const loose = entry.looseQty.trim() === '' ? (hasAny ? 0 : null) : Number(entry.looseQty);
         const countedQty =
-          bulk !== null && loose !== null ? Math.round((bulk + loose) * 10000) / 10000 : null;
+          hasAny && bulk !== null && loose !== null
+            ? Math.round((bulk + loose) * 10000) / 10000
+            : null;
         return {
           itemId: it.id,
           isNotCounted: false,
@@ -530,8 +561,10 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
       setValidationAttempted(false);
       setMessage(
         presentForApproval
-          ? 'Conteo presentado para revisión y enviado al Jefe de Control de Stock.'
-          : 'Borrador guardado correctamente.'
+          ? totalAttachmentsCount === 0
+            ? 'Conteo entregado para revisión. Aviso: quedó pendiente adjuntar la foto del conteo firmado como respaldo completo.'
+            : 'Conteo entregado para revisión y enviado al Jefe de Control de Stock.'
+          : 'Avance guardado correctamente.'
       );
       await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
@@ -557,14 +590,18 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
     }
   };
 
-  const canCounterEdit =
+  const canCounterEdit = Boolean(
     detail &&
-    (currentUser.role === UserRole.CONTADOR || currentUser.role === UserRole.JEFE_STOCK) &&
-    ([
-      CountStatus.ASIGNADO,
-      CountStatus.EN_EJECUCION,
-      CountStatus.RECHAZADO,
-    ] as CountStatus[]).includes(detail.count.status as CountStatus);
+      (currentUser.role === UserRole.CONTADOR || currentUser.role === UserRole.JEFE_STOCK) &&
+      detail.count.status === CountStatus.EJECUCION
+  );
+
+  const canUploadSheet = Boolean(
+    detail &&
+      currentUser.role !== UserRole.AUDITORIA_DIRECCION &&
+      detail.count.status !== CountStatus.RECHAZADO &&
+      (currentUser.role === UserRole.JEFE_STOCK || detail.count.status === CountStatus.EJECUCION)
+  );
 
   const detailMeta = detail ? getCountStatusMeta(String(detail.count.status)) : null;
 
@@ -629,6 +666,14 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                       {c.scheduled_date} · {c.counter_name || 'Sin asignar'} ·{' '}
                       {c.counted_items_count}/{c.items_count} ítems
                     </div>
+                    {Number(c.attachments_count || 0) === 0 &&
+                      ([CountStatus.ENTREGADO, CountStatus.APROBADO] as CountStatus[]).includes(
+                        c.status
+                      ) && (
+                        <div className="text-[10px] font-semibold text-amber-700 mt-1">
+                          Pendiente foto firmada de respaldo
+                        </div>
+                      )}
                   </button>
                 );
               })}
@@ -689,19 +734,30 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {detail.count.status === CountStatus.ASIGNADO &&
+                  {detail.count.status === CountStatus.RECHAZADO &&
                     (currentUser.role === UserRole.CONTADOR ||
                       currentUser.role === UserRole.JEFE_STOCK) && (
                       <button
                         type="button"
-                        onClick={handleStartCount}
+                        onClick={handleReopenCount}
                         disabled={saving}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 whitespace-nowrap"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-700 text-white rounded-lg hover:bg-amber-800 whitespace-nowrap"
                       >
-                        <Play className="w-3.5 h-3.5" />
-                        Iniciar Conteo
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        Reabrir en Ejecución
                       </button>
                     )}
+
+                  {detail.count.status === CountStatus.EJECUCION && (
+                    <button
+                      type="button"
+                      onClick={handleDownloadExcel}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 whitespace-nowrap"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Descargar Planilla Excel
+                    </button>
+                  )}
 
                   <button
                     type="button"
@@ -731,7 +787,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                 <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-900 space-y-1.5">
                   <div className="font-bold flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-red-700 shrink-0" />
-                    Conteo Rechazado por Control de Stock — Requiere corrección y nueva presentación
+                    Conteo Rechazado por Control de Stock — Haga clic en &quot;Reabrir en Ejecución&quot; para corregir y volver a entregar
                   </div>
                   <div>
                     <strong>Motivo del rechazo:</strong>{' '}
@@ -740,8 +796,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                   {detail.submissions.length > 0 && (
                     <div className="text-[11px] text-red-800">
                       Versión anterior conservada en historial: v{detail.submissions[0].version_number} (
-                      {detail.submissions[0].created_at.slice(0, 16)}). Corrija los datos y vuelva a
-                      presentar como v{detail.submissions[0].version_number + 1}.
+                      {detail.submissions[0].created_at.slice(0, 16)}). Al reabrir en EJECUCIÓN podrá corregir los datos y entregar la versión v{detail.submissions[0].version_number + 1}.
                     </div>
                   )}
                 </div>
@@ -783,13 +838,15 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                         </>
                       )}
                       <th className="py-2 px-2.5 text-right whitespace-nowrap">
-                        Unidades / Bultos <span className="text-red-600">*</span>
+                        Unidades / Bultos <span className="text-[10px] font-normal text-slate-400">(0 o más)</span>
                       </th>
                       <th className="py-2 px-2.5 text-right whitespace-nowrap">
-                        Unidades Sueltas <span className="text-red-600">*</span>
+                        Unidades Sueltas <span className="text-[10px] font-normal text-slate-400">(opc.)</span>
                       </th>
                       <th className="py-2 px-2.5 text-right whitespace-nowrap">
-                        {detail.count.status === CountStatus.RECHAZADO ? 'Total Corregido' : 'Total Físico'}
+                        {Boolean(detail.count.rejected_at) || (detail.submissions?.length || 0) > 0
+                          ? 'Total Corregido'
+                          : 'Total Físico'}
                       </th>
                       {!detail.isBlindRestricted && (
                         <>
@@ -809,17 +866,25 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                         notCountedReason: '',
                         obs: '',
                       };
-                      const bulkValid = entry.isNotCounted || isValidRequiredQty(entry.bulkQty);
-                      const looseValid = entry.isNotCounted || isValidRequiredQty(entry.looseQty);
+                      const hasAnyQty =
+                        entry.bulkQty.trim() !== '' || entry.looseQty.trim() !== '';
+                      const bulkValid =
+                        entry.isNotCounted ||
+                        (isValidOptionalQty(entry.bulkQty) && hasAnyQty);
+                      const looseValid = entry.isNotCounted || isValidOptionalQty(entry.looseQty);
                       const reasonValid =
                         !entry.isNotCounted || entry.notCountedReason.trim().length > 0;
+                      const bulkNum = entry.bulkQty.trim() === '' ? 0 : Number(entry.bulkQty);
+                      const looseNum = entry.looseQty.trim() === '' ? 0 : Number(entry.looseQty);
                       const rowTotal = entry.isNotCounted
                         ? null
-                        : bulkValid && looseValid
-                          ? Math.round((Number(entry.bulkQty) + Number(entry.looseQty)) * 10000) /
-                            10000
+                        : hasAnyQty &&
+                            isValidOptionalQty(entry.bulkQty) &&
+                            isValidOptionalQty(entry.looseQty)
+                          ? Math.round((bulkNum + looseNum) * 10000) / 10000
                           : null;
-                      const isRecount = detail.count.status === CountStatus.RECHAZADO;
+                      const isRecount =
+                        Boolean(detail.count.rejected_at) || (detail.submissions?.length || 0) > 0;
                       const displayBulk = isRecount ? it.recount_bulk_qty : it.bulk_qty;
                       const displayLoose = isRecount ? it.recount_loose_qty : it.loose_qty;
 
@@ -864,7 +929,6 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                                       type="number"
                                       min={0}
                                       step="any"
-                                      required
                                       aria-label={`Unidades / Bultos para ${it.sku}`}
                                       aria-invalid={!bulkValid}
                                       value={entry.bulkQty}
@@ -888,7 +952,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                                     />
                                     {validationAttempted && !bulkValid && (
                                       <span className="text-[10px] text-red-600 mt-0.5">
-                                        Requerido
+                                        Ingrese 0 o cant.
                                       </span>
                                     )}
                                   </div>
@@ -911,7 +975,6 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                                       type="number"
                                       min={0}
                                       step="any"
-                                      required
                                       aria-label={`Unidades Sueltas para ${it.sku}`}
                                       aria-invalid={!looseValid}
                                       value={entry.looseQty}
@@ -927,15 +990,13 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                                       placeholder="0"
                                       className={`w-24 px-2 py-1 text-right font-mono border rounded ${
                                         !looseValid
-                                          ? validationAttempted
-                                            ? 'border-red-500 bg-red-50/70 text-red-900'
-                                            : 'border-amber-400 bg-amber-50/30'
+                                          ? 'border-red-500 bg-red-50/70 text-red-900'
                                           : 'border-slate-300 bg-white'
                                       }`}
                                     />
-                                    {validationAttempted && !looseValid && (
+                                    {!looseValid && (
                                       <span className="text-[10px] text-red-600 mt-0.5">
-                                        Requerido
+                                        Inválido
                                       </span>
                                     )}
                                   </div>
@@ -1129,17 +1190,17 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
               </div>
 
               {/* Count-level Supporting Documentation */}
-              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5 text-xs">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="font-bold text-slate-900">
                       Planilla Firmada / Documentación Respaldatoria ({totalAttachmentsCount} adjunto(s))
                     </div>
                     <div className="text-[11px] text-slate-500">
-                      Requerido al menos 1 documento respaldatorio (planilla escaneada/foto o evidencia por ítem) para presentar el conteo.
+                      Puede presentar el conteo sin la foto firmada, pero quedará con aviso pendiente de respaldo para el cierre documental.
                     </div>
                   </div>
-                  {canCounterEdit && (
+                  {canUploadSheet && (
                     <label className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-100 font-medium text-slate-800 whitespace-nowrap">
                       <Upload className="w-3.5 h-3.5" />
                       Subir Planilla Firmada / Archivo
@@ -1155,6 +1216,23 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                     </label>
                   )}
                 </div>
+
+                {totalAttachmentsCount === 0 && detail.count.status !== CountStatus.APROBADO && (
+                  <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <div>
+                      <strong>
+                        {canCounterEdit
+                          ? 'Advertencia: Sin foto de planilla firmada adjunta.'
+                          : 'Aviso de pendiente de respaldo:'}
+                      </strong>{' '}
+                      {canCounterEdit
+                        ? 'Puede entregar el conteo igualmente, pero quedará con aviso pendiente de documentación respaldatoria.'
+                        : 'El conteo fue entregado sin la foto de la planilla firmada.'}
+                    </div>
+                  </div>
+                )}
+
                 {detail.sheetAttachments.length > 0 && (
                   <div className="flex flex-wrap gap-2 pt-1">
                     {detail.sheetAttachments.map((att) => (
@@ -1177,15 +1255,15 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                 <div className="pt-4 border-t border-slate-200 space-y-4">
                   <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
                     <div className="font-bold text-slate-900">
-                      Checklist para Presentación Formal a Revisión
+                      Checklist para Entrega Formal a Revisión
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px]">
                       <div className={isExecutionStageForPresent ? 'text-emerald-700' : 'text-amber-700'}>
-                        {isExecutionStageForPresent ? '✓' : '○'} Conteo iniciado en ejecución (
-                        {isExecutionStageForPresent ? 'Listo' : 'Hacer clic en Iniciar Conteo'})
+                        {isExecutionStageForPresent ? '✓' : '○'} Conteo en EJECUCIÓN (
+                        {isExecutionStageForPresent ? 'Listo para entrega' : 'Reabrir para editar'})
                       </div>
                       <div className={incompleteItems.length === 0 ? 'text-emerald-700' : 'text-amber-700'}>
-                        {incompleteItems.length === 0 ? '✓' : '○'} Artículos completos o justificados (
+                        {incompleteItems.length === 0 ? '✓' : '○'} Artículos completos (0 o más) o justificados (
                         {detail.items.length - incompleteItems.length}/{detail.items.length})
                       </div>
                       <div className={hasCounterSignature ? 'text-emerald-700' : 'text-amber-700'}>
@@ -1198,8 +1276,9 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                         {hasGeneralObservations ? '✓' : '○'} Observaciones generales del conteo
                       </div>
                       <div className={totalAttachmentsCount > 0 ? 'text-emerald-700' : 'text-amber-700'}>
-                        {totalAttachmentsCount > 0 ? '✓' : '○'} Documentación respaldatoria adjunta (
-                        {totalAttachmentsCount})
+                        {totalAttachmentsCount > 0
+                          ? `✓ Foto / planilla firmada adjunta (${totalAttachmentsCount})`
+                          : '⚠ Sin foto firmada (no bloquea la entrega; quedará aviso pendiente)'}
                       </div>
                     </div>
                   </div>
@@ -1246,7 +1325,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                           className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap"
                         >
                           <Save className="w-3.5 h-3.5" />
-                          Guardar Borrador
+                          Guardar Avance
                         </button>
                         <button
                           type="button"
@@ -1255,7 +1334,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                           className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] disabled:opacity-50 whitespace-nowrap"
                         >
                           <Send className="w-3.5 h-3.5" />
-                          PRESENTAR CONTEO PARA REVISIÓN
+                          ENTREGAR CONTEO PARA REVISIÓN
                         </button>
                       </div>
                     </div>
@@ -1263,7 +1342,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
                 </div>
               )}
 
-              {/* Read-only summary banner when already presented/approved/closed */}
+              {/* Read-only summary banner when already delivered/approved/rejected */}
               {!canCounterEdit && String(detail.count.counter_general_notes || '').trim() !== '' && (
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700">
                   <span className="font-semibold text-slate-900">Observaciones del contador:</span>{' '}
@@ -1274,7 +1353,7 @@ export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
               {/* Warehouse Manager Signature */}
               {(currentUser.role === UserRole.RESPONSABLE_DEPOSITO ||
                 currentUser.role === UserRole.JEFE_STOCK) &&
-                detail.count.status !== CountStatus.CERRADO && (
+                detail.count.status === CountStatus.EJECUCION && (
                   <form
                     onSubmit={handleWarehouseSign}
                     className="pt-4 border-t border-slate-200 bg-slate-50 p-4 rounded-lg space-y-3"

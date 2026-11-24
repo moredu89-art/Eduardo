@@ -119,7 +119,7 @@ export function computeRiskMatrix(
           COALESCE((
             SELECT SUM(ABS(im.quantity_delta)) FROM inventory_movements im
             WHERE im.product_id = p.id AND im.location_id = l.id
-              AND im.movement_type IN ('POS_SALE', 'POS_RESERVE', 'POS_RETURN', 'ERP_ADJUSTMENT', 'ERP_MOVEMENT')
+              AND im.movement_type IN ('ERP_ADJUSTMENT', 'ERP_MOVEMENT')
           ), 0) as rotation_qty,
           COALESCE((
             SELECT COUNT(*) FROM count_items ci
@@ -183,7 +183,7 @@ export function computeRiskMatrix(
           COALESCE((
             SELECT SUM(ABS(im.quantity_delta)) FROM inventory_movements im
             WHERE im.product_id = p.id AND im.location_id = ib.location_id
-              AND im.movement_type IN ('POS_SALE', 'POS_RESERVE', 'POS_RETURN', 'ERP_ADJUSTMENT', 'ERP_MOVEMENT')
+              AND im.movement_type IN ('ERP_ADJUSTMENT', 'ERP_MOVEMENT')
           ), 0) as rotation_qty,
           COALESCE((
             SELECT COUNT(*) FROM count_items ci
@@ -343,7 +343,7 @@ export function computeRiskMatrix(
           weight: weights.adjustmentFrequency,
         },
         {
-          variable: '10. Criticidad comercial',
+          variable: '10. Criticidad operativa',
           rawValue: criticalityLevel,
           norm: normCriticality,
           weight: weights.commercialCriticality,
@@ -601,7 +601,7 @@ export function suggestBalancedDistribution(params: {
           FROM counts c
           JOIN count_items ci ON ci.count_id = c.id
           WHERE c.assigned_counter_id = u.id
-            AND c.status IN ('ASIGNADO', 'EN_EJECUCION', 'RECHAZADO')
+            AND c.status IN ('EJECUCION', 'RECHAZADO')
         ), 0) as current_pending_items
       FROM users u
       WHERE u.role = ? AND u.is_active = 1

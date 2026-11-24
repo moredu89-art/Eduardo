@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import {
+  AlertCircle,
   AlertTriangle,
   CheckCircle2,
+  ClipboardCheck,
   Download,
   FileCheck2,
   History,
-  Lock,
   Paperclip,
   ShieldCheck,
   ThumbsUp,
@@ -30,6 +31,7 @@ interface CountSummary {
   counter_signature_name: string;
   warehouse_signature_name: string;
   chief_signature_name: string;
+  attachments_count?: number;
 }
 
 interface SubmissionRecord {
@@ -57,7 +59,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
   initialCountId = null,
 }) => {
   const [counts, setCounts] = useState<CountSummary[]>([]);
-  const [filterStatus, setFilterStatus] = useState<string>('PENDIENTE_APROBACION');
+  const [filterStatus, setFilterStatus] = useState<string>(CountStatus.ENTREGADO);
   const [selectedId, setSelectedId] = useState<number | null>(initialCountId);
   const [detail, setDetail] = useState<{
     count: Record<string, unknown>;
@@ -68,7 +70,6 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
   } | null>(null);
 
   const [chiefNotes, setChiefNotes] = useState('');
-  const [chiefSig, setChiefSig] = useState(currentUser.fullName);
   const [recountReasons, setRecountReasons] = useState<Record<number, string>>({});
 
   // In-app confirmation & rejection modals (iframe-safe, never window.confirm)
@@ -76,7 +77,6 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
   const [approvalNotesInput, setApprovalNotesInput] = useState('');
   const [rejectModalOpen, setRejectModalOpen] = useState(false);
   const [rejectionReasonInput, setRejectionReasonInput] = useState('');
-  const [closeModalOpen, setCloseModalOpen] = useState(false);
 
   const [regTarget, setRegTarget] = useState<Record<string, unknown> | null>(null);
   const [regForm, setRegForm] = useState({
@@ -125,17 +125,12 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
       if (idToOpen) {
         const matched = res.counts.find((c) => c.id === idToOpen);
         if (matched && targetOpenId) {
-          if (matched.status === CountStatus.PENDIENTE_APROBACION) {
-            setFilterStatus('PENDIENTE_APROBACION');
-          } else if (
-            matched.status === CountStatus.APROBADO ||
-            matched.status === CountStatus.PENDIENTE_REGULARIZACION
-          ) {
-            setFilterStatus('REGULARIZACION');
+          if (matched.status === CountStatus.ENTREGADO) {
+            setFilterStatus(CountStatus.ENTREGADO);
+          } else if (matched.status === CountStatus.APROBADO) {
+            setFilterStatus(CountStatus.APROBADO);
           } else if (matched.status === CountStatus.RECHAZADO) {
-            setFilterStatus('RECHAZADOS');
-          } else if (matched.status === CountStatus.CERRADO) {
-            setFilterStatus('CERRADOS');
+            setFilterStatus(CountStatus.RECHAZADO);
           } else {
             setFilterStatus('ALL');
           }
@@ -167,7 +162,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
       setApproveModalOpen(false);
       setApprovalNotesInput('');
       setMessage(
-        'Conteo aprobado por Control de Stock sin modificar el stock ERP. Ahora puede regularizar novedades o finalizar el cierre.'
+        'Conteo aprobado por Control de Stock sin modificar las existencias teóricas del ERP. Queda habilitado el seguimiento de diferencias y regularizaciones ERP.'
       );
       await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
@@ -214,22 +209,6 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
     }
   };
 
-  const handleStartRegularization = async () => {
-    if (!detail) return;
-    setError(null);
-    setMessage(null);
-    setSubmitting(true);
-    try {
-      await apiFetch(`/api/counts/${detail.count.id}/start-regularization`, { method: 'POST' });
-      setMessage('Estado actualizado a Pendiente de Regularización.');
-      await loadCounts(Number(detail.count.id));
-    } catch (err: unknown) {
-      setError((err as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
   const handleSaveRegularization = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!detail || !regTarget) return;
@@ -241,28 +220,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
         body: JSON.stringify(regForm),
       });
       setRegTarget(null);
-      setMessage('Regularización registrada con trazabilidad.');
-      await loadCounts(Number(detail.count.id));
-    } catch (err: unknown) {
-      setError((err as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleConfirmCloseCount = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!detail) return;
-    setError(null);
-    setMessage(null);
-    setSubmitting(true);
-    try {
-      await apiFetch(`/api/counts/${detail.count.id}/close`, {
-        method: 'POST',
-        body: JSON.stringify({ chiefSignatureName: chiefSig.trim() }),
-      });
-      setCloseModalOpen(false);
-      setMessage('Conteo cerrado y finalizado permanentemente con firma del Jefe de Control de Stock.');
+      setMessage('Seguimiento y comprobante de regularización ERP registrados con trazabilidad.');
       await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
       setError((err as Error).message);
@@ -320,39 +278,31 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
   };
 
   const filteredCounts = counts.filter((c) => {
-    if (filterStatus === 'PENDIENTE_APROBACION') {
-      return c.status === CountStatus.PENDIENTE_APROBACION;
+    if (filterStatus === CountStatus.ENTREGADO) {
+      return c.status === CountStatus.ENTREGADO;
     }
-    if (filterStatus === 'REGULARIZACION') {
-      return (
-        c.status === CountStatus.APROBADO ||
-        c.status === CountStatus.PENDIENTE_REGULARIZACION
-      );
+    if (filterStatus === CountStatus.APROBADO) {
+      return c.status === CountStatus.APROBADO;
     }
-    if (filterStatus === 'RECHAZADOS') {
+    if (filterStatus === CountStatus.RECHAZADO) {
       return c.status === CountStatus.RECHAZADO;
-    }
-    if (filterStatus === 'CERRADOS') {
-      return c.status === CountStatus.CERRADO;
     }
     return true;
   });
 
-  const pendingApprovalCount = counts.filter(
-    (c) => c.status === CountStatus.PENDIENTE_APROBACION
-  ).length;
-  const regCount = counts.filter(
-    (c) =>
-      c.status === CountStatus.APROBADO ||
-      c.status === CountStatus.PENDIENTE_REGULARIZACION
-  ).length;
+  const deliveredCount = counts.filter((c) => c.status === CountStatus.ENTREGADO).length;
+  const approvedCount = counts.filter((c) => c.status === CountStatus.APROBADO).length;
 
   const statusStr = detail ? String(detail.count.status) : '';
-  const isClosed = statusStr === CountStatus.CERRADO;
-  const isPendingApproval = statusStr === CountStatus.PENDIENTE_APROBACION;
-  const isApprovedOrReg =
-    statusStr === CountStatus.APROBADO ||
-    statusStr === CountStatus.PENDIENTE_REGULARIZACION;
+  const isDelivered = statusStr === CountStatus.ENTREGADO;
+  const isApproved = statusStr === CountStatus.APROBADO;
+  const isRejected = statusStr === CountStatus.RECHAZADO;
+  const isHeaderPendingReview = detail ? isDelivered : deliveredCount > 0;
+  const presenterUserId =
+    detail && detail.count.submitted_by_user_id != null
+      ? Number(detail.count.submitted_by_user_id)
+      : null;
+  const isSameSubmitter = presenterUserId !== null && presenterUserId === currentUser.id;
 
   const detailMeta = detail ? getCountStatusMeta(statusStr) : null;
 
@@ -413,20 +363,43 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold text-slate-900">
-            Aprobación, Regularización y Cierre de Conteos
+          <h2 className="text-2xl font-bold text-slate-900 flex items-center gap-2.5">
+            <span
+              className="inline-flex items-center shrink-0"
+              title={
+                isHeaderPendingReview
+                  ? detail
+                    ? 'Conteo entregado pendiente de revisión'
+                    : `${deliveredCount} conteo(s) entregado(s) pendiente(s) de revisión`
+                  : detail
+                    ? 'Conteo revisado o en ejecución'
+                    : 'Sin conteos entregados pendientes de revisión'
+              }
+            >
+              {isHeaderPendingReview ? (
+                <AlertCircle
+                  className="w-6 h-6 text-amber-600"
+                  aria-label="Pendiente de revisión"
+                />
+              ) : (
+                <ClipboardCheck
+                  className="w-6 h-6 text-emerald-600"
+                  aria-label="En progreso"
+                />
+              )}
+            </span>
+            <span>Revisión, Aprobación y Seguimiento ERP</span>
           </h2>
           <p className="text-sm text-slate-600 mt-0.5">
-            Bandeja ejecutiva del Jefe de Control de Stock. Apruebe o rechace conteos presentados, documente ajustes en ERP y ejecute el cierre definitivo.
+            Bandeja ejecutiva del Jefe de Control de Stock. Apruebe o rechace conteos entregados y registre el seguimiento de diferencias y ajustes ERP.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
           {[
-            ['PENDIENTE_APROBACION', `Pend. Aprobación (${pendingApprovalCount})`],
-            ['REGULARIZACION', `Aprobados / Reg. (${regCount})`],
-            ['RECHAZADOS', 'Rechazados'],
-            ['CERRADOS', 'Cerrados'],
+            [CountStatus.ENTREGADO, `Entregados (${deliveredCount})`],
+            [CountStatus.APROBADO, `Aprobados / Reg. (${approvedCount})`],
+            [CountStatus.RECHAZADO, 'Rechazados'],
             ['ALL', 'Todos'],
           ].map(([k, label]) => (
             <button
@@ -498,6 +471,10 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                           · {c.not_counted_items_count} N/C
                         </span>
                       )}
+                      {Number(c.attachments_count || 0) === 0 &&
+                        (c.status === CountStatus.ENTREGADO || c.status === CountStatus.APROBADO) && (
+                        <span className="text-amber-700 font-semibold"> · Pend. foto firmada</span>
+                      )}
                     </div>
                   </button>
                 );
@@ -510,7 +487,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
           {!detail ? (
             <div className="py-16 text-center text-sm text-slate-500">
               <FileCheck2 className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-              Seleccione un conteo para auditar los resultados presentados, aprobar o rechazar, documentar ajustes ERP y finalizar el cierre.
+              Seleccione un conteo para auditar los resultados entregados, aprobar o rechazar y documentar ajustes ERP.
             </div>
           ) : (
             <>
@@ -546,10 +523,10 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                   )}
                 </div>
 
-                {isClosed && (
+                {isApproved && (
                   <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
-                    <Lock className="w-4 h-4" />
-                    Cerrado Definitivamente ({String(detail.count.closed_at).slice(0, 16)})
+                    <ShieldCheck className="w-4 h-4" />
+                    Aprobado ({String(detail.count.approved_at || '').replace('T', ' ').slice(0, 16)})
                   </div>
                 )}
               </div>
@@ -634,7 +611,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                       <th className="py-2 px-2.5 text-right">R2</th>
                       <th className="py-2 px-2.5 text-right">Dif. Final</th>
                       <th className="py-2 px-2.5">Regularización ERP</th>
-                      {!isClosed && (isPendingApproval || isApprovedOrReg) && (
+                      {(isDelivered || isApproved) && (
                         <th className="py-2 px-2.5">Acción</th>
                       )}
                     </tr>
@@ -695,27 +672,21 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                               ) : (
                                 <>
                                   <div>{it.counted_qty !== null ? Number(it.counted_qty) : '—'}</div>
-                                  {it.bulk_qty !== null &&
-                                    it.bulk_qty !== undefined &&
-                                    it.loose_qty !== null &&
-                                    it.loose_qty !== undefined && (
-                                      <div className="text-[10px] text-slate-500">
-                                        {Number(it.bulk_qty)} B + {Number(it.loose_qty)} S
-                                      </div>
-                                    )}
+                                  {it.bulk_qty !== null && it.bulk_qty !== undefined && (
+                                    <div className="text-[10px] text-slate-500">
+                                      {Number(it.bulk_qty)} B + {Number(it.loose_qty ?? 0)} S
+                                    </div>
+                                  )}
                                 </>
                               )}
                             </td>
                             <td className="py-2 px-2.5 text-right font-mono tabular-nums text-blue-700 align-top">
                               <div>{it.recount_qty !== null ? Number(it.recount_qty) : '—'}</div>
-                              {it.recount_bulk_qty !== null &&
-                                it.recount_bulk_qty !== undefined &&
-                                it.recount_loose_qty !== null &&
-                                it.recount_loose_qty !== undefined && (
-                                  <div className="text-[10px] text-blue-500">
-                                    {Number(it.recount_bulk_qty)} B + {Number(it.recount_loose_qty)} S
-                                  </div>
-                                )}
+                              {it.recount_bulk_qty !== null && it.recount_bulk_qty !== undefined && (
+                                <div className="text-[10px] text-blue-500">
+                                  {Number(it.recount_bulk_qty)} B + {Number(it.recount_loose_qty ?? 0)} S
+                                </div>
+                              )}
                             </td>
                             <td
                               className={`py-2 px-2.5 text-right font-mono font-bold tabular-nums align-top ${
@@ -761,9 +732,9 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                                 </div>
                               )}
                             </td>
-                            {!isClosed && (isPendingApproval || isApprovedOrReg) && (
+                            {(isDelivered || isApproved) && (
                               <td className="py-2 px-2.5 space-y-1 align-top">
-                                {isApprovedOrReg && needsReg && (
+                                {isApproved && needsReg && (
                                   <button
                                     type="button"
                                     onClick={() => {
@@ -788,7 +759,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                                     Regularizar
                                   </button>
                                 )}
-                                {isPendingApproval && (
+                                {isDelivered && (
                                   <input
                                     type="text"
                                     placeholder="Obs. rechazo ítem..."
@@ -852,47 +823,65 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
               )}
 
               {/* Evidence Attachments */}
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg flex flex-wrap items-center justify-between gap-3 text-xs">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-semibold text-slate-800">
-                    Documentación Respaldatoria ({totalDetailAttachments}):
-                  </span>
-                  {detail.sheetAttachments.length === 0 ? (
-                    <span className="text-slate-500">Sin planilla ni comprobante a nivel conteo</span>
-                  ) : (
-                    detail.sheetAttachments.map((a) => (
-                      <button
-                        key={a.id}
-                        type="button"
-                        onClick={() => handleDownloadAttachment(a.id, a.original_name)}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 bg-white border border-slate-200 rounded text-blue-700 font-medium hover:underline"
-                      >
-                        <Download className="w-3 h-3" />
-                        {a.original_name}
-                      </button>
-                    ))
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-slate-800">
+                      Documentación Respaldatoria ({totalDetailAttachments}):
+                    </span>
+                    {detail.sheetAttachments.length === 0 ? (
+                      <span className="text-slate-500">Sin planilla ni comprobante a nivel conteo</span>
+                    ) : (
+                      detail.sheetAttachments.map((a) => (
+                        <button
+                          key={a.id}
+                          type="button"
+                          onClick={() => handleDownloadAttachment(a.id, a.original_name)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-white border border-slate-200 rounded text-blue-700 font-medium hover:underline"
+                        >
+                          <Download className="w-3 h-3" />
+                          {a.original_name}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                  {!isRejected && (
+                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-50 font-medium whitespace-nowrap">
+                      <Paperclip className="w-3.5 h-3.5" />
+                      Adjuntar Planilla / Comprobante
+                      <input
+                        type="file"
+                        accept="image/*,.pdf"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) handleUploadVoucher(f);
+                        }}
+                        className="hidden"
+                      />
+                    </label>
                   )}
                 </div>
-                {!isClosed && (
-                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-50 font-medium whitespace-nowrap">
-                    <Paperclip className="w-3.5 h-3.5" />
-                    Adjuntar Comprobante ERP
-                    <input
-                      type="file"
-                      accept="image/*,.pdf"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0];
-                        if (f) handleUploadVoucher(f);
-                      }}
-                      className="hidden"
-                    />
-                  </label>
+                {totalDetailAttachments === 0 && (
+                  <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Aviso de respaldo pendiente:</strong> Este conteo no tiene foto de planilla firmada ni comprobante adjunto aún.
+                    </span>
+                  </div>
                 )}
               </div>
 
-              {/* Stage Controls: 1. PENDIENTE_APROBACION -> Approve / Reject */}
-              {isPendingApproval && (
+              {/* Stage Controls: 1. ENTREGADO -> Approve / Reject */}
+              {isDelivered && (
                 <div className="pt-4 border-t border-slate-200 space-y-3">
+                  {isSameSubmitter && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-900 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                      <span>
+                        <strong>Segregación de funciones:</strong> Usted presentó este conteo, por lo que no está habilitado para aprobarlo. Otro Jefe de Control de Stock debe ejecutar la aprobación.
+                      </span>
+                    </div>
+                  )}
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
                       Observaciones de Auditoría del Jefe de Control de Stock
@@ -925,8 +914,8 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                         setApprovalNotesInput(chiefNotes);
                         setApproveModalOpen(true);
                       }}
-                      disabled={submitting}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 whitespace-nowrap"
+                      disabled={submitting || isSameSubmitter}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 text-white rounded-lg hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
                     >
                       <ThumbsUp className="w-3.5 h-3.5" />
                       APROBAR CONTEO
@@ -935,71 +924,37 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
                 </div>
               )}
 
-              {/* Stage Controls: 2. APROBADO / PENDIENTE_REGULARIZACION -> Regularize & Close */}
-              {isApprovedOrReg && (
-                <div className="pt-4 border-t border-slate-200 space-y-4">
-                  {reviewSummary && reviewSummary.pendingRegularization > 0 && (
-                    <div className="p-3 bg-orange-50 border border-orange-200 rounded-lg text-xs text-orange-900 flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <strong>Regularización requerida:</strong> Hay{' '}
-                        <span className="font-mono font-bold">
-                          {reviewSummary.pendingRegularization}
-                        </span>{' '}
-                        artículo(s) con diferencia o no contados que deben documentarse como{' '}
-                        <strong>AJUSTE</strong>, <strong>MOVIMIENTO</strong> o{' '}
-                        <strong>SIN AJUSTE</strong> antes del cierre definitivo.
-                      </div>
-                      {statusStr === CountStatus.APROBADO && (
-                        <button
-                          type="button"
-                          onClick={handleStartRegularization}
-                          disabled={submitting}
-                          className="px-3 py-1 text-[11px] font-medium bg-orange-700 text-white rounded hover:bg-orange-800 whitespace-nowrap"
-                        >
-                          Pasar a Pend. Regularización
-                        </button>
-                      )}
+              {/* Stage Controls: 2. APROBADO -> Discrepancy & ERP Regularization Tracking */}
+              {isApproved && (
+                <div className="pt-4 border-t border-slate-200 space-y-3">
+                  {reviewSummary && reviewSummary.pendingRegularization > 0 ? (
+                    <div className="p-3 bg-orange-50 border border-orange-200 rounded-lg text-xs text-orange-900">
+                      <strong>Seguimiento de regularizaciones ERP pendiente:</strong> Hay{' '}
+                      <span className="font-mono font-bold">
+                        {reviewSummary.pendingRegularization}
+                      </span>{' '}
+                      artículo(s) con diferencia o no contados pendientes de documentar mediante{' '}
+                      <strong>AJUSTE</strong>, <strong>MOVIMIENTO</strong> o{' '}
+                      <strong>SIN AJUSTE</strong> usando el botón <em>Regularizar</em> de cada fila.
+                    </div>
+                  ) : (
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-900 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                      <span>
+                        Conteo aprobado y todas las novedades tienen seguimiento ERP documentado. La aprobación del conteo no modifica automáticamente los saldos teóricos del ERP.
+                      </span>
                     </div>
                   )}
-
-                  <div className="flex flex-wrap items-end justify-between gap-3">
-                    <div className="w-full sm:w-72">
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Firma Final Jefe de Control de Stock (para cierre)
-                      </label>
-                      <input
-                        type="text"
-                        value={chiefSig}
-                        onChange={(e) => setChiefSig(e.target.value)}
-                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
-                      />
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => setCloseModalOpen(true)}
-                      disabled={
-                        submitting ||
-                        !chiefSig.trim() ||
-                        (reviewSummary?.pendingRegularization || 0) > 0 ||
-                        totalDetailAttachments === 0
-                      }
-                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
-                    >
-                      <Lock className="w-3.5 h-3.5" />
-                      CERRAR Y FINALIZAR CONTEO
-                    </button>
-                  </div>
                 </div>
               )}
 
-              {/* Read-only info when count is BORRADOR / ASIGNADO / EN_EJECUCION / RECHAZADO */}
-              {!isClosed && !isPendingApproval && !isApprovedOrReg && (
+              {/* Read-only info when count is EJECUCION or RECHAZADO */}
+              {!isDelivered && !isApproved && (
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600 flex items-center gap-2">
                   <ShieldCheck className="w-4 h-4 text-slate-500 shrink-0" />
                   <span>
-                    Este conteo se encuentra en etapa{' '}
-                    <strong>{detailMeta?.label}</strong>. Las acciones de aprobación, regularización y cierre se habilitan únicamente cuando el contador presenta los resultados para revisión.
+                    Este conteo se encuentra en estado{' '}
+                    <strong>{detailMeta?.label}</strong>. Las acciones de aprobación, rechazo y seguimiento de regularizaciones ERP se habilitan cuando el contador entrega los resultados para revisión.
                   </span>
                 </div>
               )}
@@ -1123,49 +1078,7 @@ export const ValidationClosureView: React.FC<ValidationClosureViewProps> = ({
         </div>
       )}
 
-      {/* Close Confirmation Modal */}
-      {closeModalOpen && detail && (
-        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-base font-bold text-slate-900">
-                Cerrar y Finalizar Conteo Definitivamente
-              </h3>
-              <button
-                type="button"
-                onClick={() => setCloseModalOpen(false)}
-                className="text-slate-400 hover:text-slate-700"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-slate-600 mb-4">
-              Esta acción bloqueará permanentemente el conteo{' '}
-              <span className="font-mono font-bold text-slate-900">
-                {String(detail.count.count_number)}
-              </span>{' '}
-              y aplicará en el balance de stock los ajustes/movimientos ERP documentados. Firma:{' '}
-              <strong>{chiefSig}</strong>.
-            </p>
-            <form onSubmit={handleConfirmCloseCount} className="flex justify-end gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setCloseModalOpen(false)}
-                className="px-4 py-2 border border-slate-300 rounded-lg"
-              >
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={submitting}
-                className="px-4 py-2 bg-slate-900 text-white rounded-lg font-semibold hover:bg-slate-800"
-              >
-                {submitting ? 'Cerrando...' : 'Cerrar y Finalizar Conteo'}
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      {/* Close modal removed in 4-state lifecycle */}
 
       {/* Regularization Modal */}
       {regTarget && (

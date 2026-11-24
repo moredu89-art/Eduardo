@@ -217,7 +217,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
           reason: assignReason,
         }),
       });
-      setMessage(`Conteo ${assignModalCount.count_number} asignado y pasado a estado ASIGNADO.`);
+      setMessage(`Conteo ${assignModalCount.count_number} asignado y listo en estado EJECUCIÓN.`);
       setAssignModalCount(null);
       setAssignCounterId('');
       setAssignReason('');
@@ -243,7 +243,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
     loadData(empty);
   };
 
-  // Summary counts across all 8 states (calculated over currently returned set or unfiltered indicator)
+  // Summary counts across all 4 states
   const stateBreakdown = COUNT_STATUS_LIST.map((st) => ({
     meta: getCountStatusMeta(st),
     total: counts.filter((c) => c.status === st).length,
@@ -267,8 +267,8 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
         </div>
       </div>
 
-      {/* 8-State Pipeline Strip (Clickable quick filter) */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+      {/* 4-State Pipeline Strip (Clickable quick filter) */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
         {stateBreakdown.map(({ meta, total }) => {
           const isSelected = filters.status === meta.status;
           return (
@@ -292,7 +292,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                   <span className={`w-2 h-2 rounded-sm shrink-0 ${meta.dotClass}`} />
                   {meta.shortLabel}
                 </span>
-                <span className="text-[10px] font-mono text-slate-400">{meta.step}/8</span>
+                <span className="text-[10px] font-mono text-slate-400">{meta.step}/4</span>
               </div>
               <div className="text-lg font-mono font-bold text-slate-900 mt-1 tabular-nums">
                 {total}
@@ -442,7 +442,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
             <span>Registro Centralizado de Conteos ({counts.length})</span>
           </div>
           <span className="text-[11px] text-slate-500">
-            Incluye conteos activos e históricos cerrados
+            Incluye conteos en ejecución, entregados, rechazados y aprobados
           </span>
         </div>
 
@@ -474,7 +474,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                 {counts.map((c) => {
                   const meta = getCountStatusMeta(c.status);
                   const isOverdue =
-                    c.status !== CountStatus.CERRADO &&
+                    c.status !== CountStatus.APROBADO &&
                     c.scheduled_date < new Date().toISOString().slice(0, 10);
 
                   return (
@@ -528,6 +528,14 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                           <span className={`w-1.5 h-1.5 rounded-sm ${meta.dotClass}`} />
                           {meta.label}
                         </span>
+                        {Number(c.attachments_count || 0) === 0 &&
+                          ([CountStatus.ENTREGADO, CountStatus.APROBADO] as CountStatus[]).includes(
+                            c.status
+                          ) && (
+                            <span className="block text-[10px] font-semibold text-amber-700 mt-1">
+                              Pend. foto firmada de respaldo
+                            </span>
+                          )}
                       </td>
                       <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 whitespace-nowrap">
                         {formatDateTimeShort(c.updated_at || c.created_at)}
@@ -544,8 +552,8 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                           </button>
 
                           {isJefe &&
-                            (c.status === CountStatus.BORRADOR ||
-                              (c.status === CountStatus.EN_EJECUCION && !c.assigned_counter_id)) && (
+                            c.status === CountStatus.EJECUCION &&
+                            !c.assigned_counter_id && (
                             <button
                               type="button"
                               onClick={() => {
@@ -561,7 +569,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                           )}
 
                           {onOpenExecution &&
-                            ([CountStatus.ASIGNADO, CountStatus.EN_EJECUCION, CountStatus.RECHAZADO] as string[]).includes(
+                            ([CountStatus.EJECUCION, CountStatus.RECHAZADO] as string[]).includes(
                               c.status
                             ) &&
                             (isContador || isJefe || currentUser.role === UserRole.RESPONSABLE_DEPOSITO) && (
@@ -577,11 +585,9 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
 
                           {onOpenValidation &&
                             isJefe &&
-                            ([
-                              CountStatus.PENDIENTE_APROBACION,
-                              CountStatus.APROBADO,
-                              CountStatus.PENDIENTE_REGULARIZACION,
-                            ] as string[]).includes(c.status) && (
+                            ([CountStatus.ENTREGADO, CountStatus.APROBADO] as string[]).includes(
+                              c.status
+                            ) && (
                               <button
                                 type="button"
                                 onClick={() => onOpenValidation(c.id)}
@@ -602,7 +608,7 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
         )}
       </div>
 
-      {/* Assign Counter Modal for BORRADOR counts */}
+      {/* Assign Counter Modal for unassigned EJECUCION counts */}
       {assignModalCount && (
         <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
           <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
@@ -741,13 +747,11 @@ export const CountsManagementView: React.FC<CountsManagementViewProps> = ({
                 </div>
               </div>
               <div>
-                <div className="text-[11px] text-slate-500">Cierre Definitivo</div>
+                <div className="text-[11px] text-slate-500">Estado de Aprobación</div>
                 <div className="font-medium text-slate-900">
-                  {detailModal.count.chief_signature_name
-                    ? `${String(detailModal.count.chief_signature_name)} (${formatDateTimeShort(
-                        detailModal.count.closed_at
-                      )})`
-                    : 'Abierto'}
+                  {detailModal.count.approved_at
+                    ? `Aprobado (${formatDateTimeShort(detailModal.count.approved_at)})`
+                    : 'Pendiente'}
                 </div>
               </div>
             </div>

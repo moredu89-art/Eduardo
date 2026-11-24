@@ -52,8 +52,6 @@ import {
   CountStatus,
   type ExcelColumnMapping,
   LocationGroup,
-  PosOperationStatus,
-  PosOperationType,
   ReconciliationResult,
   type RiskThresholds,
   type RiskWeights,
@@ -587,7 +585,7 @@ app.get('/api/locations', requireAuth, (req: AuthenticatedRequest, res) => {
         (SELECT COUNT(*) FROM inventory_balances ib WHERE ib.location_id = l.id) as skus_count,
         (SELECT COALESCE(SUM(ib.erp_physical_stock), 0) FROM inventory_balances ib WHERE ib.location_id = l.id) as total_erp_stock,
         (SELECT COALESCE(SUM(ib.available_stock), 0) FROM inventory_balances ib WHERE ib.location_id = l.id) as total_available_stock,
-        (SELECT COUNT(*) FROM counts c WHERE c.location_id = l.id AND c.status IN ('BORRADOR','ASIGNADO','EN_EJECUCION','PENDIENTE_APROBACION','RECHAZADO','APROBADO','PENDIENTE_REGULARIZACION')) as open_counts,
+        (SELECT COUNT(*) FROM counts c WHERE c.location_id = l.id AND c.status IN ('EJECUCION','ENTREGADO','RECHAZADO')) as open_counts,
         (SELECT COUNT(*) FROM count_items ci JOIN counts c ON c.id = ci.count_id WHERE c.location_id = l.id AND ci.reconciliation_result IN ('FALTANTE','SOBRANTE')) as total_discrepancies,
         (SELECT COUNT(*) FROM count_items ci JOIN counts c ON c.id = ci.count_id WHERE c.location_id = l.id AND ci.reconciliation_result = 'COINCIDENCIA') as total_matches
       FROM locations l
@@ -731,8 +729,8 @@ app.get('/api/locations/:id/detail', requireAuth, (req: AuthenticatedRequest, re
       : db
           .prepare(
             `SELECT p.id as product_id, p.sku, p.description, p.family, p.brand, p.unit_of_measure,
-              p.cost_price, p.sale_price, ib.erp_physical_stock, ib.committed_stock,
-              ib.review_stock, ib.damaged_stock, ib.pos_pending_sync, ib.available_stock,
+              p.cost_price, ib.erp_physical_stock, ib.committed_stock,
+              ib.review_stock, ib.damaged_stock, ib.available_stock,
               ib.last_erp_updated_at, ib.last_counted_at
              FROM inventory_balances ib
              JOIN products p ON p.id = ib.product_id
@@ -869,7 +867,6 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
         p.brand,
         p.unit_of_measure,
         p.cost_price,
-        p.sale_price,
         p.criticality_level,
         p.last_erp_sync_at,
         ib.location_id,
@@ -879,7 +876,6 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
         ib.committed_stock,
         ib.review_stock,
         ib.damaged_stock,
-        ib.pos_pending_sync,
         ib.available_stock,
         ib.last_erp_updated_at,
         ib.last_counted_at
@@ -929,7 +925,6 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
         p.brand,
         p.unit_of_measure,
         p.cost_price,
-        p.sale_price,
         p.criticality_level,
         p.last_erp_sync_at,
         COUNT(DISTINCT ib.location_id) as locations_count,
@@ -937,7 +932,6 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
         COALESCE(SUM(ib.committed_stock), 0) as total_committed,
         COALESCE(SUM(ib.review_stock), 0) as total_review,
         COALESCE(SUM(ib.damaged_stock), 0) as total_damaged,
-        COALESCE(SUM(ib.pos_pending_sync), 0) as total_pos_pending,
         COALESCE(SUM(ib.available_stock), 0) as total_available
       FROM products p
       ${consolidatedBalanceJoin}
@@ -1178,9 +1172,8 @@ app.get(
         COALESCE(ib.committed_stock, 0) as "Comprometido",
         COALESCE(ib.review_stock, 0) as "En Revisión",
         COALESCE(ib.damaged_stock, 0) as "Rotura",
-        COALESCE(ib.pos_pending_sync, 0) as "POS Local Sin Sync",
         COALESCE(ib.available_stock, 0) as "Disponible",
-        p.cost_price as "Costo", p.sale_price as "Precio Venta",
+        p.cost_price as "Costo",
         COALESCE(ib.last_erp_updated_at, p.last_erp_sync_at) as "Última Actualización ERP"
        FROM products p
        LEFT JOIN inventory_balances ib ON ib.product_id = p.id
@@ -1733,7 +1726,7 @@ app.post(
           assigned_counter_id, warehouse_manager_id, created_by_user_id,
           status, weekly_goal_tag, blind_printed_at, executed_at,
           started_by_user_id, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EN_EJECUCION', ?, datetime('now'), datetime('now'), ?, datetime('now'))`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EJECUCION', ?, datetime('now'), datetime('now'), ?, datetime('now'))`
       )
       .run(
         finalCountNumber,
@@ -1801,9 +1794,9 @@ app.post(
       countId,
       locationId: locId,
       previousStatus: null,
-      newStatus: CountStatus.EN_EJECUCION,
+      newStatus: CountStatus.EJECUCION,
       user: req.user!,
-      reason: `Planilla de conteo ciego validada e ingresada mediante ${actionLabel} (${insertedItems} artículo/s). Habilitada para Gestión de Conteos y Conciliación.`,
+      reason: `Planilla de conteo ciego validada e ingresada en EJECUCIÓN mediante ${actionLabel} (${insertedItems} artículo/s).`,
       metadata: {
         countNumber: finalCountNumber,
         documentUid: finalDocumentUid,
@@ -1819,7 +1812,7 @@ app.post(
         targetUserId: resolvedCounterId,
         severity: 'INFO',
         title: `Planilla ciega validada: ${finalCountNumber}`,
-        message: `Conteo en ${loc.name} (${insertedItems} artículos) emitido por ${actionLabel} y habilitado para carga de conciliación.`,
+        message: `Conteo en ${loc.name} (${insertedItems} artículos) emitido por ${actionLabel} y habilitado para ejecución.`,
         entityType: 'COUNT',
         entityId: countId,
       });
@@ -1830,7 +1823,7 @@ app.post(
         targetRole: UserRole.JEFE_STOCK,
         severity: 'INFO',
         title: `Planilla ciega validada: ${finalCountNumber}`,
-        message: `${req.user!.fullName} emitió planilla ciega (${actionLabel}) en ${loc.name} (${insertedItems} artículos) ingresada a Gestión y Conciliación.`,
+        message: `${req.user!.fullName} emitió planilla ciega (${actionLabel}) en ${loc.name} (${insertedItems} artículos) en EJECUCIÓN.`,
         entityType: 'COUNT',
         entityId: countId,
       });
@@ -1846,7 +1839,7 @@ app.post(
       newValue: {
         countNumber: finalCountNumber,
         documentUid: finalDocumentUid,
-        status: CountStatus.EN_EJECUCION,
+        status: CountStatus.EJECUCION,
         actionType: actionType || 'PRINT',
         assignedCounterId: resolvedCounterId,
         itemsCount: insertedItems,
@@ -1860,7 +1853,7 @@ app.post(
       countId,
       countNumber: finalCountNumber,
       documentUid: finalDocumentUid,
-      status: CountStatus.EN_EJECUCION,
+      status: CountStatus.EJECUCION,
       itemsCount: insertedItems,
     };
   });
@@ -1870,20 +1863,19 @@ app.post(
 });
 
 const ALLOWED_COUNT_TRANSITIONS: Record<CountStatus, CountStatus[]> = {
-  [CountStatus.BORRADOR]: [CountStatus.ASIGNADO],
-  [CountStatus.ASIGNADO]: [CountStatus.EN_EJECUCION],
-  [CountStatus.EN_EJECUCION]: [CountStatus.PENDIENTE_APROBACION],
-  [CountStatus.PENDIENTE_APROBACION]: [CountStatus.APROBADO, CountStatus.RECHAZADO],
-  [CountStatus.RECHAZADO]: [CountStatus.EN_EJECUCION, CountStatus.PENDIENTE_APROBACION],
-  [CountStatus.APROBADO]: [CountStatus.PENDIENTE_REGULARIZACION, CountStatus.CERRADO],
-  [CountStatus.PENDIENTE_REGULARIZACION]: [CountStatus.CERRADO],
-  [CountStatus.CERRADO]: [],
+  [CountStatus.EJECUCION]: [CountStatus.ENTREGADO],
+  [CountStatus.ENTREGADO]: [CountStatus.APROBADO, CountStatus.RECHAZADO],
+  [CountStatus.APROBADO]: [],
+  [CountStatus.RECHAZADO]: [CountStatus.EJECUCION],
 };
 
+function canTransitionCountStatus(from: string, to: CountStatus): boolean {
+  const allowed = ALLOWED_COUNT_TRANSITIONS[from as CountStatus];
+  return Array.isArray(allowed) && allowed.includes(to);
+}
+
 const BLIND_COUNTER_RESTRICTED_STATUSES = new Set<string>([
-  CountStatus.BORRADOR,
-  CountStatus.ASIGNADO,
-  CountStatus.EN_EJECUCION,
+  CountStatus.EJECUCION,
   CountStatus.RECHAZADO,
 ]);
 
@@ -2321,7 +2313,7 @@ app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
 });
 
 app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: AuthenticatedRequest, res) => {
-  const { locationId, scheduledDate, assignedCounterId, productIds, weeklyGoalTag, saveAsDraft } =
+  const { locationId, scheduledDate, assignedCounterId, productIds, weeklyGoalTag } =
     req.body as {
       locationId?: number;
       scheduledDate?: string;
@@ -2331,18 +2323,9 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
       saveAsDraft?: boolean;
     };
 
-  const isDraft = Boolean(saveAsDraft || !assignedCounterId);
-
   if (!locationId || !scheduledDate || !Array.isArray(productIds) || productIds.length === 0) {
     res.status(400).json({
       error: 'Ubicación, fecha programada y al menos un artículo son requeridos.',
-    });
-    return;
-  }
-
-  if (!saveAsDraft && !assignedCounterId) {
-    res.status(400).json({
-      error: 'Debe seleccionar un responsable de conteo o guardar el conteo como BORRADOR.',
     });
     return;
   }
@@ -2364,9 +2347,7 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
     }
   }
 
-  const initialStatus: CountStatus =
-    isDraft && !cleanCounterId ? CountStatus.BORRADOR : CountStatus.ASIGNADO;
-
+  const initialStatus: CountStatus = CountStatus.EJECUCION;
   const countNumber = nextSequenceNumber('CNT', 'counts', 'count_number');
   const documentUid = `DOC-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
 
@@ -2435,39 +2416,28 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
       );
     }
 
-    if (initialStatus === CountStatus.BORRADOR) {
-      recordCountStateTransition({
-        countId,
-        locationId: Number(locationId),
-        previousStatus: null,
-        newStatus: CountStatus.BORRADOR,
-        user: req.user!,
-        reason: `Conteo creado en borrador (${productIds.length} artículos, sin asignar).`,
-        metadata: { countNumber, itemsCount: productIds.length },
-        ipAddress: getClientIp(req),
-      });
-    } else {
-      recordCountStateTransition({
-        countId,
-        locationId: Number(locationId),
-        previousStatus: null,
-        newStatus: CountStatus.ASIGNADO,
-        user: req.user!,
-        reason: `Conteo creado y asignado al responsable ID ${cleanCounterId}.`,
-        metadata: { countNumber, assignedCounterId: cleanCounterId, itemsCount: productIds.length },
-        ipAddress: getClientIp(req),
-      });
+    recordCountStateTransition({
+      countId,
+      locationId: Number(locationId),
+      previousStatus: null,
+      newStatus: CountStatus.EJECUCION,
+      user: req.user!,
+      reason: cleanCounterId
+        ? `Conteo creado en EJECUCIÓN y asignado al responsable ID ${cleanCounterId} (${productIds.length} artículos).`
+        : `Conteo creado en EJECUCIÓN (${productIds.length} artículos, pendiente de asignación).`,
+      metadata: { countNumber, assignedCounterId: cleanCounterId, itemsCount: productIds.length },
+      ipAddress: getClientIp(req),
+    });
 
-      if (cleanCounterId) {
-        createNotification({
-          targetUserId: cleanCounterId,
-          severity: 'INFO',
-          title: `Nuevo conteo asignado: ${countNumber}`,
-          message: `Se asignó conteo ciego en ${loc.name} para el ${scheduledDate} (${productIds.length} artículos).`,
-          entityType: 'COUNT',
-          entityId: countId,
-        });
-      }
+    if (cleanCounterId) {
+      createNotification({
+        targetUserId: cleanCounterId,
+        severity: 'INFO',
+        title: `Nuevo conteo en ejecución: ${countNumber}`,
+        message: `Se asignó conteo ciego en ${loc.name} para el ${scheduledDate} (${productIds.length} artículos).`,
+        entityType: 'COUNT',
+        entityId: countId,
+      });
     }
 
     logAudit({
@@ -2546,7 +2516,7 @@ app.post(
               count_number, document_uid, location_id, scheduled_date,
               assigned_counter_id, warehouse_manager_id, created_by_user_id,
               status, weekly_goal_tag, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ASIGNADO', ?, datetime('now'))`
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EJECUCION', ?, datetime('now'))`
           )
           .run(
             countNumber,
@@ -2607,9 +2577,9 @@ app.post(
           countId,
           locationId: Number(locationId),
           previousStatus: null,
-          newStatus: CountStatus.ASIGNADO,
+          newStatus: CountStatus.EJECUCION,
           user: req.user!,
-          reason: `Conteo generado y asignado por planificación inteligente (${a.productIds.length} artículos).`,
+          reason: `Conteo generado en EJECUCIÓN y asignado por planificación inteligente (${a.productIds.length} artículos).`,
           metadata: { countNumber, assignedCounterId: a.counterId },
           ipAddress: getClientIp(req),
         });
@@ -2658,19 +2628,13 @@ app.post(
       res.status(404).json({ error: 'Conteo no encontrado.' });
       return;
     }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(403).json({ error: 'El conteo está cerrado y no puede reasignarse.' });
+    if (countRow.status === CountStatus.APROBADO) {
+      res.status(403).json({ error: 'El conteo está aprobado y no puede reasignarse.' });
       return;
     }
-    const canAssignInExec =
-      countRow.status === CountStatus.EN_EJECUCION && !countRow.assigned_counter_id;
-    if (
-      countRow.status !== CountStatus.BORRADOR &&
-      countRow.status !== CountStatus.ASIGNADO &&
-      !canAssignInExec
-    ) {
+    if (countRow.status !== CountStatus.EJECUCION) {
       res.status(400).json({
-        error: `Solo se puede asignar o cambiar responsable en estado BORRADOR, ASIGNADO o EN_EJECUCION sin asignar (estado actual: ${countRow.status}).`,
+        error: `Solo se puede asignar o cambiar responsable cuando el conteo está en EJECUCIÓN (estado actual: ${countRow.status}).`,
       });
       return;
     }
@@ -2691,28 +2655,28 @@ app.post(
       return;
     }
 
-    const prevStatus = String(countRow.status);
-    const nextStatus =
-      prevStatus === CountStatus.EN_EJECUCION ? CountStatus.EN_EJECUCION : CountStatus.ASIGNADO;
     const assignTx = db.transaction(() => {
       db.prepare(
         `UPDATE counts SET
           assigned_counter_id = ?,
-          status = ?,
           updated_at = datetime('now')
          WHERE id = ?`
-      ).run(Number(assignedCounterId), nextStatus, countId);
+      ).run(Number(assignedCounterId), countId);
 
-      recordCountStateTransition({
-        countId,
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'COUNT_COUNTER_ASSIGNED',
+        entityType: 'COUNT',
+        entityId: countId,
         locationId: Number(countRow.location_id),
-        previousStatus: prevStatus,
-        newStatus: nextStatus,
-        user: req.user!,
-        reason:
-          reason?.trim() ||
-          `Asignado al responsable ${check.counterUser.fullName} (${check.counterUser.username}).`,
-        metadata: { assignedCounterId: Number(assignedCounterId) },
+        oldValue: { assignedCounterId: countRow.assigned_counter_id ?? null },
+        newValue: {
+          assignedCounterId: Number(assignedCounterId),
+          reason:
+            reason?.trim() ||
+            `Asignado al responsable ${check.counterUser.fullName} (${check.counterUser.username}).`,
+        },
         ipAddress: getClientIp(req),
       });
 
@@ -2727,15 +2691,11 @@ app.post(
     });
 
     assignTx();
-    res.json({ ok: true, status: nextStatus });
+    res.json({ ok: true, status: CountStatus.EJECUCION });
   }
 );
 
-app.post(
-  '/api/counts/:id/start',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
-  (req: AuthenticatedRequest, res) => {
+function executeReopenCount(req: AuthenticatedRequest, res: express.Response): void {
   const countId = parsePositiveInt(req.params.id);
   if (!countId) {
     res.status(400).json({ error: 'Identificador de conteo inválido.' });
@@ -2748,26 +2708,22 @@ app.post(
     res.status(404).json({ error: 'Conteo no encontrado.' });
     return;
   }
-  if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'El conteo está cerrado.' });
-    return;
-  }
-  if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO) {
-    res.status(403).json({ error: 'El responsable de depósito no inicia la ejecución del conteo físico.' });
+  if (countRow.status === CountStatus.APROBADO) {
+    res.status(403).json({ error: 'El conteo ya fue aprobado y no puede reabrirse.' });
     return;
   }
   if (
     req.user!.role === UserRole.CONTADOR &&
     Number(countRow.assigned_counter_id) !== req.user!.id
   ) {
-    res.status(403).json({ error: 'Solo el contador asignado puede iniciar este conteo.' });
+    res.status(403).json({ error: 'Solo el contador asignado o el Jefe puede retomar este conteo.' });
     return;
   }
 
   const prevStatus = String(countRow.status);
-  if (prevStatus !== CountStatus.ASIGNADO && prevStatus !== CountStatus.RECHAZADO) {
+  if (!canTransitionCountStatus(prevStatus, CountStatus.EJECUCION)) {
     res.status(400).json({
-      error: `No es posible iniciar ejecución desde el estado ${prevStatus}.`,
+      error: `Transición no permitida: solo un conteo RECHAZADO puede devolverse a EJECUCIÓN (estado actual: ${prevStatus}).`,
     });
     return;
   }
@@ -2775,7 +2731,7 @@ app.post(
   const tx = db.transaction(() => {
     db.prepare(
       `UPDATE counts SET
-        status = 'EN_EJECUCION',
+        status = 'EJECUCION',
         executed_at = COALESCE(executed_at, datetime('now')),
         started_by_user_id = COALESCE(started_by_user_id, ?),
         updated_at = datetime('now')
@@ -2786,19 +2742,42 @@ app.post(
       countId,
       locationId: Number(countRow.location_id),
       previousStatus: prevStatus,
-      newStatus: CountStatus.EN_EJECUCION,
+      newStatus: CountStatus.EJECUCION,
       user: req.user!,
-      reason:
-        prevStatus === CountStatus.RECHAZADO
-          ? 'El contador reanudó la ejecución para corregir el conteo rechazado.'
-          : 'El contador inició la ejecución del conteo.',
+      reason: 'Conteo devuelto a EJECUCIÓN para corrección de resultados tras rechazo.',
+      ipAddress: getClientIp(req),
+    });
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'COUNT_REOPENED_FROM_REJECTION',
+      entityType: 'COUNT',
+      entityId: countId,
+      locationId: Number(countRow.location_id),
+      oldValue: { status: prevStatus },
+      newValue: { status: CountStatus.EJECUCION },
       ipAddress: getClientIp(req),
     });
   });
 
   tx();
-  res.json({ ok: true, status: CountStatus.EN_EJECUCION });
-});
+  res.json({ ok: true, status: CountStatus.EJECUCION });
+}
+
+app.post(
+  '/api/counts/:id/reopen',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
+  executeReopenCount
+);
+
+app.post(
+  '/api/counts/:id/start',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
+  executeReopenCount
+);
 
 app.post(
   '/api/counts/:id/mark-printed',
@@ -2834,42 +2813,15 @@ app.post(
     return;
   }
 
-  if (countRow.status !== CountStatus.CERRADO) {
-    const prevStatus = String(countRow.status);
-    const shouldMoveToExecution =
-      req.user!.role !== UserRole.RESPONSABLE_DEPOSITO &&
-      (prevStatus === CountStatus.ASIGNADO || prevStatus === CountStatus.RECHAZADO);
-
-    const printTx = db.transaction(() => {
-      db.prepare(
-        `UPDATE counts SET
-          blind_printed_at = COALESCE(blind_printed_at, datetime('now')),
-          executed_at = CASE WHEN ? THEN COALESCE(executed_at, datetime('now')) ELSE executed_at END,
-          started_by_user_id = CASE WHEN ? THEN COALESCE(started_by_user_id, ?) ELSE started_by_user_id END,
-          status = CASE WHEN ? THEN 'EN_EJECUCION' ELSE status END,
-          updated_at = datetime('now')
-         WHERE id = ?`
-      ).run(
-        shouldMoveToExecution ? 1 : 0,
-        shouldMoveToExecution ? 1 : 0,
-        req.user!.id,
-        shouldMoveToExecution ? 1 : 0,
-        countId
-      );
-
-      if (shouldMoveToExecution) {
-        recordCountStateTransition({
-          countId,
-          locationId: Number(countRow.location_id),
-          previousStatus: prevStatus,
-          newStatus: CountStatus.EN_EJECUCION,
-          user: req.user!,
-          reason: 'Inicio automático de ejecución al imprimir planilla ciega.',
-          ipAddress: getClientIp(req),
-        });
-      }
-    });
-    printTx();
+  if (countRow.status !== CountStatus.APROBADO) {
+    db.prepare(
+      `UPDATE counts SET
+        blind_printed_at = COALESCE(blind_printed_at, datetime('now')),
+        executed_at = CASE WHEN status = 'EJECUCION' THEN COALESCE(executed_at, datetime('now')) ELSE executed_at END,
+        started_by_user_id = CASE WHEN status = 'EJECUCION' THEN COALESCE(started_by_user_id, ?) ELSE started_by_user_id END,
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(req.user!.id, countId);
   }
 
   logAudit({
@@ -2883,6 +2835,164 @@ app.post(
   });
   res.json({ ok: true });
 });
+
+function sanitizeSpreadsheetCell(value: unknown): string {
+  const text = String(value ?? '');
+  return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+}
+
+app.get(
+  '/api/counts/:id/export-excel',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+    const countId = parsePositiveInt(req.params.id);
+    if (!countId) {
+      res.status(400).json({ error: 'Identificador de conteo inválido.' });
+      return;
+    }
+
+    const countRow = db
+      .prepare(
+        `SELECT c.*, l.name as location_name, l.code as location_code
+         FROM counts c
+         JOIN locations l ON l.id = c.location_id
+         WHERE c.id = ?`
+      )
+      .get(countId) as Record<string, unknown> | undefined;
+
+    if (!countRow) {
+      res.status(404).json({ error: 'Conteo no encontrado.' });
+      return;
+    }
+
+    if (
+      req.user!.role === UserRole.CONTADOR &&
+      Number(countRow.assigned_counter_id) !== req.user!.id
+    ) {
+      res.status(403).json({ error: 'Solo el contador asignado o el Jefe puede descargar esta planilla.' });
+      return;
+    }
+    if (
+      req.user!.role === UserRole.RESPONSABLE_DEPOSITO &&
+      !userCanAccessLocation(req.user!, Number(countRow.location_id))
+    ) {
+      res.status(403).json({ error: 'No tiene permisos sobre la ubicación de este conteo.' });
+      return;
+    }
+
+    if (countRow.status !== CountStatus.EJECUCION) {
+      res.status(400).json({
+        error: `La planilla Excel solo puede descargarse cuando el conteo está en EJECUCIÓN (estado actual: ${countRow.status}).`,
+      });
+      return;
+    }
+
+    const rawItems = db
+      .prepare(
+        `SELECT ci.*, p.sku, p.description, p.family, p.brand, p.unit_of_measure
+         FROM count_items ci
+         JOIN products p ON p.id = ci.product_id
+         WHERE ci.count_id = ?
+         ORDER BY p.description ASC`
+      )
+      .all(countId) as Array<Record<string, unknown>>;
+
+    const submissionsCntRow = db
+      .prepare('SELECT COUNT(*) as cnt FROM count_submissions WHERE count_id = ?')
+      .get(countId) as { cnt: number };
+    const isPostRejection =
+      Boolean(countRow.rejected_at) || Number(submissionsCntRow.cnt || 0) > 0;
+
+    // Strictly blind export: never expose snapshot_erp_stock, difference, or reconciliation_result
+    const sheetRows = rawItems.map((it) => {
+      const bulkVal = isPostRejection
+        ? it.recount_bulk_qty ?? it.bulk_qty
+        : it.bulk_qty;
+      const looseVal = isPostRejection
+        ? it.recount_loose_qty ?? it.loose_qty
+        : it.loose_qty;
+
+      return {
+        SKU: sanitizeSpreadsheetCell(it.sku),
+        Descripción: sanitizeSpreadsheetCell(it.description),
+        Familia: sanitizeSpreadsheetCell(it.family || 'General'),
+        Marca: sanitizeSpreadsheetCell(it.brand || 'Sin marca'),
+        'U.M.': sanitizeSpreadsheetCell(it.unit_of_measure || 'UN'),
+        'Unidades / Bultos':
+          bulkVal !== null && bulkVal !== undefined && Number.isFinite(Number(bulkVal))
+            ? Number(bulkVal)
+            : '',
+        'Unidades Sueltas':
+          looseVal !== null && looseVal !== undefined && Number.isFinite(Number(looseVal))
+            ? Number(looseVal)
+            : '',
+        Observaciones: sanitizeSpreadsheetCell(it.counter_observations || ''),
+      };
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(sheetRows, {
+      header: [
+        'SKU',
+        'Descripción',
+        'Familia',
+        'Marca',
+        'U.M.',
+        'Unidades / Bultos',
+        'Unidades Sueltas',
+        'Observaciones',
+      ],
+    });
+    ws['!cols'] = [
+      { wch: 18 },
+      { wch: 44 },
+      { wch: 18 },
+      { wch: 18 },
+      { wch: 8 },
+      { wch: 18 },
+      { wch: 18 },
+      { wch: 32 },
+    ];
+    XLSX.utils.book_append_sheet(wb, ws, 'Planilla_Conteo');
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+
+    db.prepare(
+      `UPDATE counts SET
+        blind_printed_at = COALESCE(blind_printed_at, datetime('now')),
+        executed_at = COALESCE(executed_at, datetime('now')),
+        started_by_user_id = COALESCE(started_by_user_id, ?),
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(req.user!.id, countId);
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'BLIND_SHEET_EXCEL_DOWNLOADED',
+      entityType: 'COUNT',
+      entityId: countId,
+      locationId: Number(countRow.location_id),
+      newValue: {
+        countNumber: countRow.count_number,
+        itemsCount: rawItems.length,
+        isPostRejection,
+      },
+      ipAddress: getClientIp(req),
+    });
+
+    const safeCountNumber = String(countRow.count_number || countId).replace(/[^A-Za-z0-9_-]/g, '_');
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Planilla_Conteo_${safeCountNumber}.xlsx"`
+    );
+    res.send(buffer);
+  }
+);
 
 function handleCountResultsOrPresentation(
   req: AuthenticatedRequest,
@@ -2903,8 +3013,17 @@ function handleCountResultsOrPresentation(
     return;
   }
 
-  if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'El conteo está cerrado y no admite modificaciones.' });
+  const prevStatus = String(countRow.status);
+  if (prevStatus === CountStatus.APROBADO || prevStatus === CountStatus.ENTREGADO) {
+    res.status(403).json({
+      error: `El conteo se encuentra en estado ${prevStatus} y no admite edición por parte del contador.`,
+    });
+    return;
+  }
+  if (prevStatus === CountStatus.RECHAZADO) {
+    res.status(400).json({
+      error: 'El conteo fue RECHAZADO. Primero debe reabrirlo a estado EJECUCIÓN para poder corregir y volver a presentar resultados.',
+    });
     return;
   }
 
@@ -2926,7 +3045,6 @@ function handleCountResultsOrPresentation(
     return;
   }
 
-  const prevStatus = String(countRow.status);
   const body = req.body as {
     items?: Array<{
       itemId: number;
@@ -2944,27 +3062,11 @@ function handleCountResultsOrPresentation(
 
   const submitForReview = forcePresent || Boolean(body.submitForReview);
 
-  if (submitForReview) {
-    if (
-      prevStatus !== CountStatus.EN_EJECUCION &&
-      prevStatus !== CountStatus.RECHAZADO
-    ) {
-      res.status(400).json({
-        error: `No se puede saltar etapas: el conteo está en estado ${prevStatus}. Debe estar EN EJECUCIÓN o RECHAZADO para presentarlo a aprobación.`,
-      });
-      return;
-    }
-  } else {
-    if (
-      !(
-        [CountStatus.ASIGNADO, CountStatus.EN_EJECUCION, CountStatus.RECHAZADO] as string[]
-      ).includes(prevStatus)
-    ) {
-      res.status(403).json({
-        error: `No se pueden editar cantidades en el estado actual (${prevStatus}).`,
-      });
-      return;
-    }
+  if (submitForReview && !canTransitionCountStatus(prevStatus, CountStatus.ENTREGADO)) {
+    res.status(400).json({
+      error: `Transición no permitida: el conteo está en estado ${prevStatus}. Debe estar en EJECUCIÓN para presentarlo.`,
+    });
+    return;
   }
 
   const items = Array.isArray(body.items) ? body.items : [];
@@ -2973,7 +3075,10 @@ function handleCountResultsOrPresentation(
     return;
   }
 
-  const isRecount = prevStatus === CountStatus.RECHAZADO;
+  const submissionsCountRow = db
+    .prepare('SELECT COUNT(*) as cnt FROM count_submissions WHERE count_id = ?')
+    .get(countId) as { cnt: number };
+  const isRecount = Boolean(countRow.rejected_at) || Number(submissionsCountRow.cnt || 0) > 0;
   const generalObsTrimmed =
     body.generalObservations !== undefined
       ? String(body.generalObservations).trim()
@@ -3043,35 +3148,55 @@ function handleCountResultsOrPresentation(
         continue;
       }
 
+      const hasRawBulk =
+        entry.bulkQty !== undefined &&
+        entry.bulkQty !== null &&
+        String(entry.bulkQty).trim() !== '';
+      const hasRawLoose =
+        entry.looseQty !== undefined &&
+        entry.looseQty !== null &&
+        String(entry.looseQty).trim() !== '';
       const parsedBulk = parseOptionalNonNeg(entry.bulkQty);
       const parsedLoose = parseOptionalNonNeg(entry.looseQty);
 
-      if (submitForReview && (parsedBulk === null || parsedLoose === null)) {
+      if (hasRawBulk && parsedBulk === null) {
         throw new Error(
-          'Debe completar tanto "Unidades / Bultos" como "Unidades Sueltas" (o justificar como No contado) en todos los artículos.'
+          `El valor de "Unidades / Bultos" en ${existing.sku} debe ser un número válido mayor o igual a 0.`
         );
       }
 
-      if (parsedBulk === null || parsedLoose === null) {
+      if (hasRawLoose && parsedLoose === null) {
+        throw new Error(
+          `El valor de "Unidades Sueltas" en ${existing.sku} debe ser un número válido mayor o igual a 0.`
+        );
+      }
+
+      if (submitForReview && parsedBulk === null && parsedLoose === null) {
+        throw new Error(
+          'Debe ingresar una cantidad válida (puede ser 0) o justificar como "No contado" en todos los artículos.'
+        );
+      }
+
+      if (parsedBulk === null && parsedLoose === null) {
         if (isRecount) {
           db.prepare(
             `UPDATE count_items SET
               is_not_counted = 0,
               not_counted_reason = '',
-              recount_bulk_qty = ?,
-              recount_loose_qty = ?,
+              recount_bulk_qty = NULL,
+              recount_loose_qty = NULL,
               recount_qty = NULL,
               counter_observations = COALESCE(NULLIF(?, ''), counter_observations),
               updated_at = datetime('now')
              WHERE id = ?`
-          ).run(parsedBulk, parsedLoose, obsText, existing.id);
+          ).run(obsText, existing.id);
         } else {
           db.prepare(
             `UPDATE count_items SET
               is_not_counted = 0,
               not_counted_reason = '',
-              bulk_qty = ?,
-              loose_qty = ?,
+              bulk_qty = NULL,
+              loose_qty = NULL,
               counted_qty = NULL,
               final_counted_qty = NULL,
               difference = NULL,
@@ -3079,12 +3204,14 @@ function handleCountResultsOrPresentation(
               counter_observations = ?,
               updated_at = datetime('now')
              WHERE id = ?`
-          ).run(parsedBulk, parsedLoose, obsText, existing.id);
+          ).run(obsText, existing.id);
         }
         continue;
       }
 
-      const qty = Math.round((parsedBulk + parsedLoose) * 10000) / 10000;
+      const effectiveBulk = parsedBulk ?? 0;
+      const effectiveLoose = parsedLoose ?? 0;
+      const qty = Math.round((effectiveBulk + effectiveLoose) * 10000) / 10000;
       const snapshotErp = Number(existing.snapshot_erp_stock);
       const diff = Math.round((qty - snapshotErp) * 10000) / 10000;
       const recResult =
@@ -3114,7 +3241,7 @@ function handleCountResultsOrPresentation(
             historical_alert_text = ?,
             updated_at = datetime('now')
            WHERE id = ?`
-        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
+        ).run(effectiveBulk, effectiveLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
       } else {
         db.prepare(
           `UPDATE count_items SET
@@ -3130,7 +3257,7 @@ function handleCountResultsOrPresentation(
             historical_alert_text = ?,
             updated_at = datetime('now')
            WHERE id = ?`
-        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
+        ).run(effectiveBulk, effectiveLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
       }
 
       if (submitForReview) {
@@ -3162,10 +3289,8 @@ function handleCountResultsOrPresentation(
           continue;
         }
         const hasValues = isRecount
-          ? it.recount_bulk_qty !== null &&
-            it.recount_loose_qty !== null &&
-            it.final_counted_qty !== null
-          : it.bulk_qty !== null && it.loose_qty !== null && it.final_counted_qty !== null;
+          ? it.recount_bulk_qty !== null && it.final_counted_qty !== null
+          : it.bulk_qty !== null && it.final_counted_qty !== null;
         if (!hasValues) {
           missingItems.push(String(it.sku));
         }
@@ -3199,13 +3324,9 @@ function handleCountResultsOrPresentation(
         );
       }
 
-      // 5. Required supporting attachment uploaded
+      // 5. Supporting attachment is advisory on presentation (pending closure if omitted)
       const evidenceCount = getDocumentaryEvidenceCountForCount(countId);
-      if (evidenceCount === 0) {
-        throw new Error(
-          'Condición de presentación incumplida: debe cargar al menos un archivo adjunto respaldatorio (planilla firmada o foto de ítem) antes de presentar el conteo.'
-        );
-      }
+      const pendingEvidence = evidenceCount === 0;
 
       const maxVerRow = db
         .prepare('SELECT COALESCE(MAX(version_number), 0) as max_ver FROM count_submissions WHERE count_id = ?')
@@ -3234,7 +3355,7 @@ function handleCountResultsOrPresentation(
           count_id, version_number, submitted_by_user_id, submitted_by_username,
           counter_signature_name, warehouse_signature_name, general_observations,
           items_snapshot_json, outcome_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE_APROBACION')`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ENTREGADO')`
       ).run(
         countId,
         nextVer,
@@ -3248,7 +3369,7 @@ function handleCountResultsOrPresentation(
 
       db.prepare(
         `UPDATE counts SET
-          status = 'PENDIENTE_APROBACION',
+          status = 'ENTREGADO',
           submitted_at = datetime('now'),
           submitted_by_user_id = ?,
           counter_signature_name = ?,
@@ -3262,10 +3383,16 @@ function handleCountResultsOrPresentation(
         countId,
         locationId: Number(countRow.location_id),
         previousStatus: prevStatus,
-        newStatus: CountStatus.PENDIENTE_APROBACION,
+        newStatus: CountStatus.ENTREGADO,
         user: req.user!,
-        reason: `Conteo presentado para revisión (Versión v${nextVer}). Observaciones: ${generalObsTrimmed}`,
-        metadata: { versionNumber: nextVer, attachmentsCount: evidenceCount },
+        reason: pendingEvidence
+          ? `Conteo entregado para revisión (Versión v${nextVer}) — AVISO: pendiente foto/planilla firmada. Observaciones: ${generalObsTrimmed}`
+          : `Conteo entregado para revisión (Versión v${nextVer}). Observaciones: ${generalObsTrimmed}`,
+        metadata: {
+          versionNumber: nextVer,
+          attachmentsCount: evidenceCount,
+          pendingDocumentaryEvidence: pendingEvidence,
+        },
         ipAddress: getClientIp(req),
       });
 
@@ -3278,9 +3405,13 @@ function handleCountResultsOrPresentation(
 
       createNotification({
         targetRole: UserRole.JEFE_STOCK,
-        severity: discrepancies > 0 ? 'ALTA' : 'INFO',
-        title: `Conteo ${countRow.count_number} pendiente de aprobación (v${nextVer})`,
-        message: `Presentado por ${req.user!.fullName}. Se detectaron ${discrepancies} novedad(es) o diferencia(s) para auditar.`,
+        severity: discrepancies > 0 || pendingEvidence ? 'ALTA' : 'INFO',
+        title: `Conteo ${countRow.count_number} entregado para revisión (v${nextVer})`,
+        message: `Presentado por ${req.user!.fullName}. ${discrepancies} novedad(es) o diferencia(s).${
+          pendingEvidence
+            ? ' Pendiente foto/planilla firmada de respaldo.'
+            : ''
+        }`,
         entityType: 'COUNT',
         entityId: countId,
       });
@@ -3292,13 +3423,19 @@ function handleCountResultsOrPresentation(
         entityType: 'COUNT',
         entityId: countId,
         locationId: Number(countRow.location_id),
-        newValue: { versionNumber: nextVer, itemsCount: allCountItems.length, discrepancies },
+        newValue: {
+          versionNumber: nextVer,
+          status: CountStatus.ENTREGADO,
+          itemsCount: allCountItems.length,
+          discrepancies,
+          pendingDocumentaryEvidence: pendingEvidence,
+        },
         ipAddress: getClientIp(req),
       });
+      return { missingEvidenceWarning: pendingEvidence };
     } else {
       db.prepare(
         `UPDATE counts SET
-          status = CASE WHEN status IN ('ASIGNADO', 'RECHAZADO') THEN 'EN_EJECUCION' ELSE status END,
           executed_at = COALESCE(executed_at, datetime('now')),
           started_by_user_id = COALESCE(started_by_user_id, ?),
           counter_signature_name = CASE WHEN ? != '' THEN ? ELSE counter_signature_name END,
@@ -3314,18 +3451,6 @@ function handleCountResultsOrPresentation(
         countId
       );
 
-      if (prevStatus === CountStatus.ASIGNADO || prevStatus === CountStatus.RECHAZADO) {
-        recordCountStateTransition({
-          countId,
-          locationId: Number(countRow.location_id),
-          previousStatus: prevStatus,
-          newStatus: CountStatus.EN_EJECUCION,
-          user: req.user!,
-          reason: 'Borrador guardado durante relevamiento físico.',
-          ipAddress: getClientIp(req),
-        });
-      }
-
       logAudit({
         userId: req.user!.id,
         username: req.user!.username,
@@ -3336,14 +3461,16 @@ function handleCountResultsOrPresentation(
         newValue: { itemsUpdated: items.length, isRecount },
         ipAddress: getClientIp(req),
       });
+      return { missingEvidenceWarning: false };
     }
   });
 
   try {
-    tx();
+    const outcome = tx();
     res.json({
       ok: true,
-      status: submitForReview ? CountStatus.PENDIENTE_APROBACION : CountStatus.EN_EJECUCION,
+      status: submitForReview ? CountStatus.ENTREGADO : CountStatus.EJECUCION,
+      missingEvidenceWarning: Boolean(outcome?.missingEvidenceWarning),
     });
   } catch (err: unknown) {
     res.status(400).json({ error: (err as Error).message });
@@ -3387,8 +3514,10 @@ app.post(
       res.status(404).json({ error: 'Conteo no encontrado.' });
       return;
     }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(403).json({ error: 'El conteo está cerrado y no admite importación.' });
+    if (countRow.status !== CountStatus.EJECUCION) {
+      res.status(403).json({
+        error: `Solo se pueden importar resultados en estado EJECUCIÓN (estado actual: ${countRow.status}).`,
+      });
       return;
     }
     if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO) {
@@ -3397,10 +3526,7 @@ app.post(
     }
     if (
       req.user!.role === UserRole.CONTADOR &&
-      (Number(countRow.assigned_counter_id) !== req.user!.id ||
-        !(
-          [CountStatus.ASIGNADO, CountStatus.EN_EJECUCION, CountStatus.RECHAZADO] as CountStatus[]
-        ).includes(countRow.status as CountStatus))
+      Number(countRow.assigned_counter_id) !== req.user!.id
     ) {
       res.status(403).json({ error: 'No tiene permisos para importar resultados en este conteo.' });
       return;
@@ -3456,12 +3582,13 @@ app.post(
 
         if (bulkCol || looseCol) {
           if (bulkVal === null && looseVal === null) continue;
+          const resolvedLoose = looseVal ?? (bulkVal !== null ? 0 : null);
           matched.push({
             itemId,
             sku,
             bulkQty: bulkVal,
-            looseQty: looseVal,
-            countedQty: (bulkVal ?? 0) + (looseVal ?? 0),
+            looseQty: resolvedLoose,
+            countedQty: (bulkVal ?? 0) + (resolvedLoose ?? 0),
             observations: obsCol ? String(row[obsCol] ?? '').trim() : '',
           });
         } else if (singleVal !== null) {
@@ -3510,8 +3637,10 @@ app.post(
     return;
   }
 
-  if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'El conteo ya fue cerrado y no admite modificaciones.' });
+  if (countRow.status !== CountStatus.EJECUCION) {
+    res.status(403).json({
+      error: `La firma del Responsable de Depósito solo se registra en estado EJECUCIÓN (estado actual: ${countRow.status}).`,
+    });
     return;
   }
 
@@ -3569,13 +3698,13 @@ function executeRejectCount(
     res.status(404).json({ error: 'Conteo no encontrado.' });
     return;
   }
-  if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'No se puede rechazar un conteo ya cerrado.' });
+  if (countRow.status === CountStatus.APROBADO) {
+    res.status(403).json({ error: 'No se puede rechazar un conteo ya aprobado.' });
     return;
   }
-  if (countRow.status !== CountStatus.PENDIENTE_APROBACION) {
+  if (!canTransitionCountStatus(String(countRow.status), CountStatus.RECHAZADO)) {
     res.status(400).json({
-      error: `Solo se puede rechazar un conteo en estado PENDIENTE DE APROBACIÓN (estado actual: ${countRow.status}).`,
+      error: `Solo se puede rechazar un conteo en estado ENTREGADO (estado actual: ${countRow.status}).`,
     });
     return;
   }
@@ -3585,7 +3714,7 @@ function executeRejectCount(
     const latestSub = db
       .prepare(
         `SELECT id FROM count_submissions
-         WHERE count_id = ? AND outcome_status = 'PENDIENTE_APROBACION'
+         WHERE count_id = ? AND outcome_status = 'ENTREGADO'
          ORDER BY version_number DESC LIMIT 1`
       )
       .get(countId) as { id: number } | undefined;
@@ -3682,11 +3811,13 @@ function executeApproveCount(
     res.status(400).json({ error: 'Identificador de conteo inválido.' });
     return;
   }
-  const { approvalNotes, chiefNotes } = req.body as {
+  const { approvalNotes, chiefNotes, chiefSignatureName } = req.body as {
     approvalNotes?: string;
     chiefNotes?: string;
+    chiefSignatureName?: string;
   };
   const notesText = (approvalNotes ?? chiefNotes ?? '').trim();
+  const signatureText = (chiefSignatureName ?? req.user!.fullName).trim();
 
   const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
     | Record<string, unknown>
@@ -3695,13 +3826,36 @@ function executeApproveCount(
     res.status(404).json({ error: 'Conteo no encontrado.' });
     return;
   }
-  if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'El conteo ya está cerrado.' });
+  if (countRow.status === CountStatus.APROBADO) {
+    res.status(403).json({ error: 'El conteo ya se encuentra aprobado.' });
     return;
   }
-  if (countRow.status !== CountStatus.PENDIENTE_APROBACION) {
+  if (!canTransitionCountStatus(String(countRow.status), CountStatus.APROBADO)) {
     res.status(400).json({
-      error: `No se puede aprobar el conteo desde el estado ${countRow.status}. Debe encontrarse en PENDIENTE DE APROBACIÓN.`,
+      error: `No se puede aprobar el conteo desde el estado ${countRow.status}. Debe encontrarse en ENTREGADO.`,
+    });
+    return;
+  }
+
+  const latestSub = db
+    .prepare(
+      `SELECT id, submitted_by_user_id FROM count_submissions
+       WHERE count_id = ? AND outcome_status = 'ENTREGADO'
+       ORDER BY version_number DESC LIMIT 1`
+    )
+    .get(countId) as { id: number; submitted_by_user_id: number | null } | undefined;
+
+  // Segregation of duties: whoever presented the count CANNOT approve it
+  const presenterUserId =
+    latestSub?.submitted_by_user_id ??
+    (countRow.submitted_by_user_id !== null && countRow.submitted_by_user_id !== undefined
+      ? Number(countRow.submitted_by_user_id)
+      : null);
+
+  if (presenterUserId !== null && Number(presenterUserId) === req.user!.id) {
+    res.status(403).json({
+      error:
+        'Segregación de funciones: quien presentó el conteo no puede aprobarlo. Debe revisarlo y aprobarlo otro usuario con rol Jefe de Control de Stock.',
     });
     return;
   }
@@ -3717,13 +3871,6 @@ function executeApproveCount(
   );
 
   const tx = db.transaction(() => {
-    const latestSub = db
-      .prepare(
-        `SELECT id FROM count_submissions
-         WHERE count_id = ? AND outcome_status = 'PENDIENTE_APROBACION'
-         ORDER BY version_number DESC LIMIT 1`
-      )
-      .get(countId) as { id: number } | undefined;
     if (latestSub) {
       db.prepare(
         `UPDATE count_submissions SET
@@ -3743,6 +3890,8 @@ function executeApproveCount(
         approved_by_user_id = ?,
         approval_notes = ?,
         validated_at = datetime('now'),
+        chief_signature_name = ?,
+        chief_signed_at = datetime('now'),
         chief_notes = ?,
         has_post_snapshot_movements = ?,
         updated_at = datetime('now')
@@ -3750,6 +3899,7 @@ function executeApproveCount(
     ).run(
       req.user!.id,
       notesText,
+      signatureText,
       notesText,
       postMovements.length > 0 ? 1 : 0,
       countId
@@ -3761,8 +3911,10 @@ function executeApproveCount(
       previousStatus: String(countRow.status),
       newStatus: CountStatus.APROBADO,
       user: req.user!,
-      reason: notesText || 'Resultado físico aprobado por el Jefe de Control de Stock (stock ERP intacto).',
-      metadata: { postSnapshotMovementsCount: postMovements.length },
+      reason:
+        notesText ||
+        'Resultado físico aprobado por Jefatura de Control de Stock (seguimiento de regularizaciones ERP habilitado; existencias ERP no alteradas).',
+      metadata: { postSnapshotMovementsCount: postMovements.length, erpStockMutated: false },
       ipAddress: getClientIp(req),
     });
 
@@ -3784,7 +3936,12 @@ function executeApproveCount(
       entityType: 'COUNT',
       entityId: countId,
       locationId: Number(countRow.location_id),
-      newValue: { approvalNotes: notesText, postSnapshotMovementsCount: postMovements.length },
+      newValue: {
+        approvalNotes: notesText,
+        chiefSignatureName: signatureText,
+        postSnapshotMovementsCount: postMovements.length,
+        erpStockMutated: false,
+      },
       ipAddress: getClientIp(req),
     });
   });
@@ -3808,51 +3965,6 @@ app.post(
 );
 
 app.post(
-  '/api/counts/:id/start-regularization',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK),
-  (req: AuthenticatedRequest, res) => {
-    const countId = parsePositiveInt(req.params.id);
-    if (!countId) {
-      res.status(400).json({ error: 'Identificador de conteo inválido.' });
-      return;
-    }
-    const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
-      | Record<string, unknown>
-      | undefined;
-    if (!countRow) {
-      res.status(404).json({ error: 'Conteo no encontrado.' });
-      return;
-    }
-    if (countRow.status !== CountStatus.APROBADO) {
-      res.status(400).json({
-        error: `Solo un conteo APROBADO puede pasar a PENDIENTE DE REGULARIZACIÓN (estado actual: ${countRow.status}).`,
-      });
-      return;
-    }
-
-    const tx = db.transaction(() => {
-      db.prepare(
-        "UPDATE counts SET status = 'PENDIENTE_REGULARIZACION', updated_at = datetime('now') WHERE id = ?"
-      ).run(countId);
-
-      recordCountStateTransition({
-        countId,
-        locationId: Number(countRow.location_id),
-        previousStatus: String(countRow.status),
-        newStatus: CountStatus.PENDIENTE_REGULARIZACION,
-        user: req.user!,
-        reason: 'Circuito de regularización y documentación de ajustes habilitado.',
-        ipAddress: getClientIp(req),
-      });
-    });
-
-    tx();
-    res.json({ ok: true, status: CountStatus.PENDIENTE_REGULARIZACION });
-  }
-);
-
-app.post(
   '/api/counts/:id/items/:itemId/regularize',
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
@@ -3870,16 +3982,9 @@ app.post(
       res.status(404).json({ error: 'Conteo no encontrado.' });
       return;
     }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(403).json({ error: 'No se pueden modificar regularizaciones de un conteo cerrado.' });
-      return;
-    }
-    if (
-      countRow.status !== CountStatus.APROBADO &&
-      countRow.status !== CountStatus.PENDIENTE_REGULARIZACION
-    ) {
+    if (countRow.status !== CountStatus.APROBADO) {
       res.status(400).json({
-        error: `No se pueden registrar regularizaciones en estado ${countRow.status}. Primero debe aprobar el conteo.`,
+        error: `Solo se pueden registrar regularizaciones ERP cuando el conteo está en estado APROBADO (estado actual: ${countRow.status}).`,
       });
       return;
     }
@@ -3937,23 +4042,7 @@ app.post(
     }
 
     const regTx = db.transaction(() => {
-      if (countRow.status === CountStatus.APROBADO) {
-        db.prepare(
-          "UPDATE counts SET status = 'PENDIENTE_REGULARIZACION', updated_at = datetime('now') WHERE id = ?"
-        ).run(countId);
-
-        recordCountStateTransition({
-          countId,
-          locationId: Number(countRow.location_id),
-          previousStatus: CountStatus.APROBADO,
-          newStatus: CountStatus.PENDIENTE_REGULARIZACION,
-          user: req.user!,
-          reason: 'Transición automática a regularización al documentar primera novedad.',
-          ipAddress: getClientIp(req),
-        });
-      } else {
-        db.prepare("UPDATE counts SET updated_at = datetime('now') WHERE id = ?").run(countId);
-      }
+      db.prepare("UPDATE counts SET updated_at = datetime('now') WHERE id = ?").run(countId);
 
       db.prepare(
         `UPDATE count_items SET
@@ -3986,195 +4075,19 @@ app.post(
           adjustmentStatus: itemRow.adjustment_status,
           erpOperationNumber: itemRow.erp_operation_number,
         },
-        newValue: { adjustmentStatus, erpOperationNumber, noAdjustmentReason, adjustmentNotes },
-        ipAddress: getClientIp(req),
-      });
-    });
-
-    regTx();
-    res.json({ ok: true, status: CountStatus.PENDIENTE_REGULARIZACION });
-  }
-);
-
-app.post(
-  '/api/counts/:id/close',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK),
-  (req: AuthenticatedRequest, res) => {
-    const countId = parsePositiveInt(req.params.id);
-    if (!countId) {
-      res.status(400).json({ error: 'Identificador de conteo inválido.' });
-      return;
-    }
-    const { chiefSignatureName } = req.body as { chiefSignatureName?: string };
-
-    const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
-      | Record<string, unknown>
-      | undefined;
-    if (!countRow) {
-      res.status(404).json({ error: 'Conteo no encontrado.' });
-      return;
-    }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(400).json({ error: 'El conteo ya se encuentra cerrado y finalizado.' });
-      return;
-    }
-    if (
-      countRow.status !== CountStatus.APROBADO &&
-      countRow.status !== CountStatus.PENDIENTE_REGULARIZACION
-    ) {
-      res.status(400).json({
-        error: `Condición de cierre incumplida: no se pueden saltar etapas. El conteo debe haber sido APROBADO antes del cierre (estado actual: ${countRow.status}).`,
-      });
-      return;
-    }
-    if (!chiefSignatureName || !chiefSignatureName.trim()) {
-      res.status(400).json({
-        error: 'Condición de cierre incumplida: debe registrar la firma final del Jefe de Control de Stock.',
-      });
-      return;
-    }
-
-    const items = db
-      .prepare('SELECT * FROM count_items WHERE count_id = ?')
-      .all(countId) as Array<Record<string, unknown>>;
-
-    for (const it of items) {
-      const isNotCounted = Number(it.is_not_counted || 0) === 1;
-      if (!isNotCounted && (it.final_counted_qty === null || it.reconciliation_result === null)) {
-        res.status(400).json({
-          error: 'Condición de cierre incumplida: todos los artículos deben tener resultado físico o justificación de no conteo.',
-        });
-        return;
-      }
-      const needsRegularization =
-        isNotCounted || it.reconciliation_result !== ReconciliationResult.COINCIDENCIA;
-      if (needsRegularization) {
-        if (it.adjustment_status === AdjustmentOperationType.PENDIENTE) {
-          res.status(400).json({
-            error:
-              'Condición de cierre incumplida: existen diferencias o ítems no contados sin regularizar ni justificar como "Sin ajuste".',
-          });
-          return;
-        }
-        if (
-          (it.adjustment_status === AdjustmentOperationType.AJUSTE ||
-            it.adjustment_status === AdjustmentOperationType.MOVIMIENTO) &&
-          !String(it.erp_operation_number || '').trim()
-        ) {
-          res.status(400).json({
-            error: 'Condición de cierre incumplida: falta el número de operación del ERP en una regularización.',
-          });
-          return;
-        }
-        if (
-          it.adjustment_status === AdjustmentOperationType.SIN_AJUSTE &&
-          !String(it.no_adjustment_reason || '').trim()
-        ) {
-          res.status(400).json({
-            error: 'Condición de cierre incumplida: falta la justificación expresa en una línea marcada como "Sin ajuste".',
-          });
-          return;
-        }
-      }
-    }
-
-    const attachmentsCount = getAttachmentsCountForCount(countId);
-    if (attachmentsCount === 0) {
-      res.status(400).json({
-        error:
-          'Condición de cierre incumplida: debe adjuntar al menos un documento respaldatorio (planilla firmada o comprobante ERP) antes del cierre definitivo.',
-      });
-      return;
-    }
-
-    const postMovements = getPostSnapshotMovementsForCount(
-      countId,
-      Number(countRow.location_id),
-      String(countRow.created_at),
-      items.map((it) => Number(it.product_id))
-    );
-
-    const prevStatus = String(countRow.status);
-    const closeTx = db.transaction(() => {
-      for (const it of items) {
-        if (
-          Number(it.is_not_counted || 0) === 0 &&
-          it.reconciliation_result !== ReconciliationResult.COINCIDENCIA &&
-          (it.adjustment_status === AdjustmentOperationType.AJUSTE ||
-            it.adjustment_status === AdjustmentOperationType.MOVIMIENTO)
-        ) {
-          const diff = Number(it.difference || 0);
-          db.prepare(
-            `INSERT INTO inventory_movements (
-              product_id, location_id, movement_type, quantity_delta, stock_bucket,
-              reference_type, reference_id, erp_operation_number, user_id, notes
-            ) VALUES (?, ?, ?, ?, 'PHYSICAL', 'COUNT_CLOSURE', ?, ?, ?, ?)`
-          ).run(
-            it.product_id,
-            countRow.location_id,
-            it.adjustment_status === AdjustmentOperationType.AJUSTE
-              ? 'ERP_ADJUSTMENT'
-              : 'ERP_MOVEMENT',
-            diff,
-            String(countId),
-            it.erp_operation_number,
-            req.user!.id,
-            `Cierre conteo ${countRow.count_number} — Op. ERP ${it.erp_operation_number}`
-          );
-
-          db.prepare(
-            `UPDATE inventory_balances
-             SET erp_physical_stock = erp_physical_stock + ?
-             WHERE product_id = ? AND location_id = ?`
-          ).run(diff, it.product_id, countRow.location_id);
-
-          recomputeAvailableStock(Number(it.product_id), Number(countRow.location_id));
-        }
-      }
-
-      db.prepare(
-        `UPDATE counts SET
-          status = 'CERRADO',
-          closed_at = datetime('now'),
-          closed_by_user_id = ?,
-          chief_signature_name = ?,
-          chief_signed_at = datetime('now'),
-          has_post_snapshot_movements = ?,
-          updated_at = datetime('now')
-         WHERE id = ?`
-      ).run(req.user!.id, chiefSignatureName.trim(), postMovements.length > 0 ? 1 : 0, countId);
-
-      recordCountStateTransition({
-        countId,
-        locationId: Number(countRow.location_id),
-        previousStatus: prevStatus,
-        newStatus: CountStatus.CERRADO,
-        user: req.user!,
-        reason: `Cierre y finalización definitiva del conteo con firma de ${chiefSignatureName.trim()}.`,
-        metadata: { attachmentsCount, hasPostSnapshotMovements: postMovements.length > 0 },
-        ipAddress: getClientIp(req),
-      });
-
-      logAudit({
-        userId: req.user!.id,
-        username: req.user!.username,
-        action: 'COUNT_CLOSED_PERMANENTLY',
-        entityType: 'COUNT',
-        entityId: countId,
-        locationId: Number(countRow.location_id),
         newValue: {
-          chiefSignatureName: chiefSignatureName.trim(),
-          itemsCount: items.length,
-          attachmentsCount,
-          hasPostSnapshotMovements: postMovements.length > 0,
+          adjustmentStatus,
+          erpOperationNumber,
+          noAdjustmentReason,
+          adjustmentNotes,
+          erpStockMutated: false,
         },
         ipAddress: getClientIp(req),
       });
     });
 
-    closeTx();
-    res.json({ ok: true, status: CountStatus.CERRADO });
+    regTx();
+    res.json({ ok: true, status: CountStatus.APROBADO });
   }
 );
 
@@ -4208,8 +4121,12 @@ function authorizeAttachmentEntity(
       | { id: number; location_id: number; assigned_counter_id: number; status: string }
       | undefined;
     if (!item) return { ok: false, status: 404, error: 'Ítem de conteo no encontrado.' };
-    if (mode === 'WRITE' && item.status === CountStatus.CERRADO) {
-      return { ok: false, status: 403, error: 'El conteo está cerrado y no admite nuevos adjuntos.' };
+    if (mode === 'WRITE' && item.status !== CountStatus.EJECUCION) {
+      return {
+        ok: false,
+        status: 403,
+        error: `Solo se pueden cargar adjuntos de ítems cuando el conteo está en EJECUCIÓN (estado actual: ${item.status}).`,
+      };
     }
     if (user.role === UserRole.JEFE_STOCK) return { ok: true, locationId: item.location_id };
     if (mode === 'READ' && user.role === UserRole.AUDITORIA_DIRECCION) {
@@ -4234,8 +4151,24 @@ function authorizeAttachmentEntity(
       | { id: number; location_id: number; assigned_counter_id: number; status: string }
       | undefined;
     if (!count) return { ok: false, status: 404, error: 'Conteo no encontrado.' };
-    if (mode === 'WRITE' && count.status === CountStatus.CERRADO) {
-      return { ok: false, status: 403, error: 'El conteo está cerrado y no admite nuevos adjuntos.' };
+    if (mode === 'WRITE') {
+      if (count.status === CountStatus.RECHAZADO) {
+        return {
+          ok: false,
+          status: 403,
+          error: 'El conteo fue rechazado; debe reabrirlo a EJECUCIÓN antes de cargar nuevos adjuntos.',
+        };
+      }
+      if (
+        (user.role === UserRole.CONTADOR || user.role === UserRole.RESPONSABLE_DEPOSITO) &&
+        count.status !== CountStatus.EJECUCION
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          error: `No se pueden cargar adjuntos en el estado actual (${count.status}).`,
+        };
+      }
     }
     if (user.role === UserRole.JEFE_STOCK) return { ok: true, locationId: count.location_id };
     if (mode === 'READ' && user.role === UserRole.AUDITORIA_DIRECCION) {
@@ -4260,20 +4193,6 @@ function authorizeAttachmentEntity(
     return { ok: false, status: 403, error: 'No tiene permisos sobre la ubicación de este conteo.' };
   }
 
-  if (entityType === 'POS_OPERATION') {
-    if (user.role === UserRole.CONTADOR) {
-      return { ok: false, status: 403, error: 'Los contadores no acceden a documentación de Punto de Venta.' };
-    }
-    const op = db
-      .prepare('SELECT id, location_id FROM pos_operations WHERE id = ?')
-      .get(entityId) as { id: number; location_id: number } | undefined;
-    if (!op) return { ok: false, status: 404, error: 'Operación comercial no encontrada.' };
-    if (!userCanAccessLocation(user, op.location_id)) {
-      return { ok: false, status: 403, error: 'No tiene permisos sobre la ubicación de esta operación.' };
-    }
-    return { ok: true, locationId: op.location_id };
-  }
-
   return { ok: false, status: 400, error: 'Tipo de entidad inválido.' };
 }
 
@@ -4291,7 +4210,7 @@ app.post(
     const parsedEntityId = parsePositiveInt(entityId);
     if (
       !entityType ||
-      !['COUNT_ITEM', 'COUNT_SHEET', 'ADJUSTMENT', 'POS_OPERATION'].includes(entityType) ||
+      !['COUNT_ITEM', 'COUNT_SHEET', 'ADJUSTMENT'].includes(entityType) ||
       !parsedEntityId
     ) {
       fs.unlink(req.file.path, () => {});
@@ -4391,496 +4310,7 @@ app.get('/api/attachments/:id', requireAuth, (req: AuthenticatedRequest, res) =>
 });
 
 // ============================================================================
-// 8. POINT OF SALE (PUNTO DE VENTA — Section 10)
-// ============================================================================
-
-app.get('/api/pos/catalog', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.user!.role === UserRole.CONTADOR) {
-    res.status(403).json({
-      error: 'Los contadores no operan en el módulo Punto de Venta ni consultan existencias teóricas.',
-    });
-    return;
-  }
-
-  const locationId = req.query.locationId ? Number(req.query.locationId) : null;
-  const search = String(req.query.search || '').trim();
-
-  if (locationId && !userCanAccessLocation(req.user!, locationId)) {
-    res.status(403).json({ error: 'No tiene permisos sobre esta ubicación.' });
-    return;
-  }
-
-  const conds: string[] = [];
-  const params: unknown[] = [];
-
-  if (locationId) {
-    conds.push('ib.location_id = ?');
-    params.push(locationId);
-  } else if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
-    if (req.user!.assignedLocationIds.length === 0) {
-      res.json({ catalog: [] });
-      return;
-    }
-    conds.push(`ib.location_id IN (${req.user!.assignedLocationIds.map(() => '?').join(',')})`);
-    params.push(...req.user!.assignedLocationIds);
-  }
-
-  if (search) {
-    conds.push('(p.sku LIKE ? OR p.description LIKE ? OR p.alias LIKE ?)');
-    const like = `%${search}%`;
-    params.push(like, like, like);
-  }
-
-  const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
-  const catalog = db
-    .prepare(
-      `SELECT p.id as product_id, p.sku, p.description, p.alias, p.family, p.brand,
-        p.unit_of_measure, p.sale_price, ib.location_id, l.name as location_name,
-        ib.erp_physical_stock, ib.committed_stock, ib.pos_pending_sync,
-        ib.review_stock, ib.available_stock
-       FROM inventory_balances ib
-       JOIN products p ON p.id = ib.product_id
-       JOIN locations l ON l.id = ib.location_id
-       ${whereSql}
-       ORDER BY p.description ASC
-       LIMIT 300`
-    )
-    .all(...params);
-
-  res.json({ catalog });
-});
-
-app.get('/api/pos/operations', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.user!.role === UserRole.CONTADOR) {
-    res.status(403).json({ error: 'Acceso denegado.' });
-    return;
-  }
-  const locationId = req.query.locationId ? parsePositiveInt(req.query.locationId) : null;
-  const status = String(req.query.status || '').trim();
-
-  if (locationId && !userCanAccessLocation(req.user!, locationId)) {
-    res.status(403).json({ error: 'No tiene permisos sobre esta ubicación.' });
-    return;
-  }
-
-  const conds: string[] = [];
-  const params: unknown[] = [];
-
-  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
-    if (req.user!.assignedLocationIds.length === 0) {
-      res.json({ operations: [] });
-      return;
-    }
-    conds.push(`po.location_id IN (${req.user!.assignedLocationIds.map(() => '?').join(',')})`);
-    params.push(...req.user!.assignedLocationIds);
-  }
-  if (locationId) {
-    conds.push('po.location_id = ?');
-    params.push(locationId);
-  }
-  if (status) {
-    conds.push('po.status = ?');
-    params.push(status);
-  }
-
-  const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
-  const ops = db
-    .prepare(
-      `SELECT po.*, l.name as location_name, u.full_name as created_by_name
-       FROM pos_operations po
-       JOIN locations l ON l.id = po.location_id
-       JOIN users u ON u.id = po.created_by_user_id
-       ${whereSql}
-       ORDER BY po.created_at DESC LIMIT 100`
-    )
-    .all(...params) as Array<Record<string, unknown>>;
-
-  const enriched = ops.map((op) => {
-    const items = db
-      .prepare(
-        `SELECT poi.*, p.sku, p.description, p.unit_of_measure
-         FROM pos_operation_items poi
-         JOIN products p ON p.id = poi.product_id
-         WHERE poi.operation_id = ?`
-      )
-      .all(op.id);
-    return { ...op, items };
-  });
-
-  res.json({ operations: enriched });
-});
-
-app.post(
-  '/api/pos/operations',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
-  (req: AuthenticatedRequest, res) => {
-
-  const { operationType, locationId, customerName, customerDoc, notes, items } = req.body as {
-    operationType?: PosOperationType;
-    locationId?: number;
-    customerName?: string;
-    customerDoc?: string;
-    notes?: string;
-    items?: Array<{ productId: number; quantity: number; unitPrice: number }>;
-  };
-
-  if (
-    !operationType ||
-    !Object.values(PosOperationType).includes(operationType) ||
-    !locationId ||
-    !Array.isArray(items) ||
-    items.length === 0
-  ) {
-    res.status(400).json({ error: 'Tipo de operación, ubicación y al menos un artículo son requeridos.' });
-    return;
-  }
-
-  if (!userCanAccessLocation(req.user!, Number(locationId))) {
-    res.status(403).json({ error: 'No tiene permisos sobre la ubicación seleccionada.' });
-    return;
-  }
-
-  if (operationType === PosOperationType.DEVOLUCION && (!notes || !notes.trim())) {
-    res.status(400).json({
-      error: 'Las devoluciones requieren documentar el motivo y comprobante de referencia.',
-    });
-    return;
-  }
-
-  const opNumber = nextSequenceNumber('POS', 'pos_operations', 'operation_number');
-  const initialStatus =
-    operationType === PosOperationType.RESERVA
-      ? PosOperationStatus.PENDIENTE
-      : PosOperationStatus.CONFIRMADA;
-
-  const tx = db.transaction(() => {
-    let subtotal = 0;
-    for (const item of items) {
-      const qty = Number(item.quantity);
-      const price = Number(item.unitPrice);
-      if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(price) || price < 0) {
-        throw new Error('Cantidades y precios deben ser valores positivos.');
-      }
-
-      const bal = db
-        .prepare('SELECT available_stock FROM inventory_balances WHERE product_id = ? AND location_id = ?')
-        .get(item.productId, locationId) as { available_stock: number } | undefined;
-
-      if (!bal) {
-        throw new Error('Uno de los artículos no registra balance en la ubicación seleccionada.');
-      }
-
-      if (
-        (operationType === PosOperationType.VENTA || operationType === PosOperationType.RESERVA) &&
-        bal.available_stock < qty
-      ) {
-        throw new Error(
-          `Stock disponible insuficiente (disponible: ${bal.available_stock}, solicitado: ${qty}).`
-        );
-      }
-
-      subtotal += qty * price;
-    }
-
-    const opInfo = db
-      .prepare(
-        `INSERT INTO pos_operations (
-          operation_number, operation_type, location_id, customer_name, customer_doc,
-          status, subtotal, total, notes, erp_sync_status, created_by_user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MODULO_INDEPENDIENTE_LOCAL', ?)`
-      )
-      .run(
-        opNumber,
-        operationType,
-        locationId,
-        (customerName || 'Consumidor Final').trim(),
-        (customerDoc || '').trim(),
-        initialStatus,
-        subtotal,
-        subtotal,
-        (notes || '').trim(),
-        req.user!.id
-      );
-
-    const opId = Number(opInfo.lastInsertRowid);
-    const insItem = db.prepare(
-      'INSERT INTO pos_operation_items (operation_id, product_id, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?)'
-    );
-
-    for (const item of items) {
-      const qty = Number(item.quantity);
-      const price = Number(item.unitPrice);
-      insItem.run(opId, item.productId, qty, price, qty * price);
-
-      if (operationType === PosOperationType.VENTA) {
-        // Record movement without silently overwriting official ERP physical stock
-        db.prepare(
-          'UPDATE inventory_balances SET pos_pending_sync = pos_pending_sync + ? WHERE product_id = ? AND location_id = ?'
-        ).run(qty, item.productId, locationId);
-        db.prepare(
-          `INSERT INTO inventory_movements (
-            product_id, location_id, movement_type, quantity_delta, stock_bucket,
-            reference_type, reference_id, user_id, notes
-          ) VALUES (?, ?, 'POS_SALE', ?, 'PHYSICAL', 'POS_OPERATION', ?, ?, ?)`
-        ).run(item.productId, locationId, -qty, String(opId), req.user!.id, `Venta local ${opNumber}`);
-      } else if (operationType === PosOperationType.RESERVA) {
-        db.prepare(
-          'UPDATE inventory_balances SET committed_stock = committed_stock + ? WHERE product_id = ? AND location_id = ?'
-        ).run(qty, item.productId, locationId);
-        db.prepare(
-          `INSERT INTO inventory_movements (
-            product_id, location_id, movement_type, quantity_delta, stock_bucket,
-            reference_type, reference_id, user_id, notes
-          ) VALUES (?, ?, 'POS_RESERVE', ?, 'COMMITTED', 'POS_OPERATION', ?, ?, ?)`
-        ).run(item.productId, locationId, qty, String(opId), req.user!.id, `Reserva ${opNumber}`);
-      } else if (operationType === PosOperationType.DEVOLUCION) {
-        db.prepare(
-          'UPDATE inventory_balances SET review_stock = review_stock + ? WHERE product_id = ? AND location_id = ?'
-        ).run(qty, item.productId, locationId);
-        db.prepare(
-          `INSERT INTO inventory_movements (
-            product_id, location_id, movement_type, quantity_delta, stock_bucket,
-            reference_type, reference_id, user_id, notes
-          ) VALUES (?, ?, 'POS_RETURN', ?, 'REVIEW', 'POS_OPERATION', ?, ?, ?)`
-        ).run(
-          item.productId,
-          locationId,
-          qty,
-          String(opId),
-          req.user!.id,
-          `Devolución ${opNumber}: ${notes}`
-        );
-      }
-
-      recomputeAvailableStock(item.productId, Number(locationId));
-    }
-
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: `POS_${operationType}_CREATED`,
-      entityType: 'POS_OPERATION',
-      entityId: opId,
-      locationId: Number(locationId),
-      newValue: { opNumber, operationType, subtotal, itemsCount: items.length },
-      ipAddress: getClientIp(req),
-    });
-
-    return { id: opId, operationNumber: opNumber, status: initialStatus, total: subtotal };
-  });
-
-  try {
-    const result = tx();
-    res.status(201).json(result);
-  } catch (err: unknown) {
-    res.status(400).json({ error: (err as Error).message });
-  }
-});
-
-app.post(
-  '/api/pos/operations/:id/confirm',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
-  (req: AuthenticatedRequest, res) => {
-
-  const opId = parsePositiveInt(req.params.id);
-  if (!opId) {
-    res.status(400).json({ error: 'Identificador de operación inválido.' });
-    return;
-  }
-  const op = db.prepare('SELECT * FROM pos_operations WHERE id = ?').get(opId) as
-    | Record<string, unknown>
-    | undefined;
-  if (!op) {
-    res.status(404).json({ error: 'Operación no encontrada.' });
-    return;
-  }
-  if (!userCanAccessLocation(req.user!, Number(op.location_id))) {
-    res.status(403).json({ error: 'No tiene permisos para confirmar operaciones en esta ubicación.' });
-    return;
-  }
-  if (op.status !== PosOperationStatus.PENDIENTE || op.operation_type !== PosOperationType.RESERVA) {
-    res.status(400).json({ error: 'Solo pueden confirmarse reservas en estado PENDIENTE.' });
-    return;
-  }
-
-  const items = db
-    .prepare('SELECT * FROM pos_operation_items WHERE operation_id = ?')
-    .all(opId) as Array<{ product_id: number; quantity: number }>;
-
-  const tx = db.transaction(() => {
-    for (const it of items) {
-      db.prepare(
-        `UPDATE inventory_balances
-         SET committed_stock = MAX(0, committed_stock - ?),
-             pos_pending_sync = pos_pending_sync + ?
-         WHERE product_id = ? AND location_id = ?`
-      ).run(it.quantity, it.quantity, it.product_id, op.location_id);
-
-      db.prepare(
-        `INSERT INTO inventory_movements (
-          product_id, location_id, movement_type, quantity_delta, stock_bucket,
-          reference_type, reference_id, user_id, notes
-        ) VALUES (?, ?, 'POS_SALE', ?, 'PHYSICAL', 'POS_OPERATION', ?, ?, ?)`
-      ).run(
-        it.product_id,
-        op.location_id,
-        -it.quantity,
-        String(opId),
-        req.user!.id,
-        `Reserva ${op.operation_number} convertida en venta confirmada`
-      );
-
-      recomputeAvailableStock(it.product_id, Number(op.location_id));
-    }
-
-    db.prepare(
-      "UPDATE pos_operations SET status = 'CONFIRMADA', updated_at = datetime('now') WHERE id = ?"
-    ).run(opId);
-
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: 'POS_RESERVATION_CONFIRMED',
-      entityType: 'POS_OPERATION',
-      entityId: opId,
-      locationId: Number(op.location_id),
-      ipAddress: getClientIp(req),
-    });
-  });
-
-  tx();
-  res.json({ ok: true });
-});
-
-app.post(
-  '/api/pos/operations/:id/void',
-  requireAuth,
-  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
-  (req: AuthenticatedRequest, res) => {
-
-  const opId = parsePositiveInt(req.params.id);
-  if (!opId) {
-    res.status(400).json({ error: 'Identificador de operación inválido.' });
-    return;
-  }
-  const { reason } = req.body as { reason?: string };
-  if (!reason || !reason.trim()) {
-    res.status(400).json({ error: 'Debe especificar el motivo de anulación para mantener trazabilidad.' });
-    return;
-  }
-
-  const op = db.prepare('SELECT * FROM pos_operations WHERE id = ?').get(opId) as
-    | Record<string, unknown>
-    | undefined;
-  if (!op) {
-    res.status(404).json({ error: 'Operación no encontrada.' });
-    return;
-  }
-  if (!userCanAccessLocation(req.user!, Number(op.location_id))) {
-    res.status(403).json({ error: 'No tiene permisos para anular operaciones en esta ubicación.' });
-    return;
-  }
-  if (op.status === PosOperationStatus.ANULADA) {
-    res.status(400).json({ error: 'La operación ya fue anulada.' });
-    return;
-  }
-
-  const items = db
-    .prepare('SELECT * FROM pos_operation_items WHERE operation_id = ?')
-    .all(opId) as Array<{ product_id: number; quantity: number }>;
-
-  const tx = db.transaction(() => {
-    for (const it of items) {
-      if (op.operation_type === PosOperationType.RESERVA && op.status === PosOperationStatus.PENDIENTE) {
-        db.prepare(
-          'UPDATE inventory_balances SET committed_stock = MAX(0, committed_stock - ?) WHERE product_id = ? AND location_id = ?'
-        ).run(it.quantity, it.product_id, op.location_id);
-      } else if (
-        op.operation_type === PosOperationType.VENTA ||
-        (op.operation_type === PosOperationType.RESERVA && op.status === PosOperationStatus.CONFIRMADA)
-      ) {
-        db.prepare(
-          'UPDATE inventory_balances SET pos_pending_sync = MAX(0, pos_pending_sync - ?) WHERE product_id = ? AND location_id = ?'
-        ).run(it.quantity, it.product_id, op.location_id);
-      } else if (op.operation_type === PosOperationType.DEVOLUCION) {
-        db.prepare(
-          'UPDATE inventory_balances SET review_stock = MAX(0, review_stock - ?) WHERE product_id = ? AND location_id = ?'
-        ).run(it.quantity, it.product_id, op.location_id);
-      }
-
-      db.prepare(
-        `INSERT INTO inventory_movements (
-          product_id, location_id, movement_type, quantity_delta, stock_bucket,
-          reference_type, reference_id, user_id, notes
-        ) VALUES (?, ?, 'POS_VOID', ?, 'PHYSICAL', 'POS_OPERATION', ?, ?, ?)`
-      ).run(
-        it.product_id,
-        op.location_id,
-        it.quantity,
-        String(opId),
-        req.user!.id,
-        `Anulación ${op.operation_number}: ${reason.trim()}`
-      );
-
-      recomputeAvailableStock(it.product_id, Number(op.location_id));
-    }
-
-    db.prepare(
-      `UPDATE pos_operations SET
-        status = 'ANULADA',
-        voided_by_user_id = ?,
-        void_reason = ?,
-        updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(req.user!.id, reason.trim(), opId);
-
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: 'POS_OPERATION_VOIDED',
-      entityType: 'POS_OPERATION',
-      entityId: opId,
-      locationId: Number(op.location_id),
-      oldValue: { status: op.status },
-      newValue: { status: 'ANULADA', reason: reason.trim() },
-      ipAddress: getClientIp(req),
-    });
-  });
-
-  tx();
-  res.json({ ok: true });
-});
-
-app.get('/api/pos/export-erp', requireAuth, requireRole(UserRole.JEFE_STOCK), (_req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT po.operation_number as "Nro Operación", po.operation_type as "Tipo",
-        po.status as "Estado", l.code as "Cód. Ubicación", l.name as "Ubicación",
-        p.sku as "Código Artículo", p.description as "Descripción",
-        poi.quantity as "Cantidad", poi.unit_price as "Precio Unitario",
-        poi.line_total as "Subtotal", po.customer_name as "Cliente",
-        po.created_at as "Fecha Operación", po.erp_sync_status as "Estado ERP"
-       FROM pos_operations po
-       JOIN pos_operation_items poi ON poi.operation_id = po.id
-       JOIN products p ON p.id = poi.product_id
-       JOIN locations l ON l.id = po.location_id
-       ORDER BY po.created_at DESC`
-    )
-    .all();
-
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(rows);
-  XLSX.utils.book_append_sheet(wb, ws, 'Movimientos_POS_ERP');
-  const buf = Buffer.from(XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }));
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', 'attachment; filename="Movimientos_POS_Para_ERP.xlsx"');
-  res.send(buf);
-});
-
-// ============================================================================
-// 9. EXECUTIVE DASHBOARD, AI ANALYTICS, NOTIFICATIONS, AUDIT & BACKUP
+// 8. EXECUTIVE DASHBOARD, AI ANALYTICS, NOTIFICATIONS, AUDIT & BACKUP
 // ============================================================================
 
 app.get(
@@ -4925,14 +4355,10 @@ app.get(
     .prepare(
       `SELECT
         COUNT(*) as total_counts,
-        SUM(CASE WHEN c.status = 'BORRADOR' THEN 1 ELSE 0 END) as borradores,
-        SUM(CASE WHEN c.status = 'ASIGNADO' THEN 1 ELSE 0 END) as asignados,
-        SUM(CASE WHEN c.status = 'EN_EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
-        SUM(CASE WHEN c.status = 'PENDIENTE_APROBACION' THEN 1 ELSE 0 END) as pendientes_aprobacion,
+        SUM(CASE WHEN c.status = 'EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
+        SUM(CASE WHEN c.status = 'ENTREGADO' THEN 1 ELSE 0 END) as entregados,
         SUM(CASE WHEN c.status = 'RECHAZADO' THEN 1 ELSE 0 END) as rechazados,
-        SUM(CASE WHEN c.status = 'APROBADO' THEN 1 ELSE 0 END) as aprobados,
-        SUM(CASE WHEN c.status = 'PENDIENTE_REGULARIZACION' THEN 1 ELSE 0 END) as pendientes_regularizacion,
-        SUM(CASE WHEN c.status = 'CERRADO' THEN 1 ELSE 0 END) as cerrados
+        SUM(CASE WHEN c.status = 'APROBADO' THEN 1 ELSE 0 END) as aprobados
        FROM counts c ${countWhere}`
     )
     .get(...countParams) as Record<string, number>;
@@ -5001,7 +4427,7 @@ app.get(
     .prepare(
       `SELECT u.id, u.full_name,
         COUNT(DISTINCT c.id) as total_counts,
-        SUM(CASE WHEN c.status IN ('PENDIENTE_APROBACION', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO') THEN 1 ELSE 0 END) as completed_counts,
+        SUM(CASE WHEN c.status IN ('ENTREGADO', 'APROBADO') THEN 1 ELSE 0 END) as completed_counts,
         (SELECT COUNT(*) FROM count_items ci2 JOIN counts c2 ON c2.id = ci2.count_id
          WHERE c2.assigned_counter_id = u.id AND ci2.final_counted_qty IS NOT NULL) as total_items_counted,
         (SELECT COUNT(*) FROM count_items ci3 JOIN counts c3 ON c3.id = ci3.count_id
@@ -5098,62 +4524,31 @@ app.get(
     .prepare(
       `SELECT
         COUNT(*) as total_created,
-        SUM(CASE WHEN status IN ('ASIGNADO', 'EN_EJECUCION', 'RECHAZADO') THEN 1 ELSE 0 END) as active_counts,
-        SUM(CASE WHEN status = 'BORRADOR' THEN 1 ELSE 0 END) as borradores,
-        SUM(CASE WHEN status = 'ASIGNADO' THEN 1 ELSE 0 END) as asignados,
-        SUM(CASE WHEN status = 'EN_EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
-        SUM(CASE WHEN status = 'PENDIENTE_APROBACION' THEN 1 ELSE 0 END) as pendientes_aprobacion,
+        SUM(CASE WHEN status IN ('EJECUCION', 'RECHAZADO') THEN 1 ELSE 0 END) as active_counts,
+        SUM(CASE WHEN status = 'EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
+        SUM(CASE WHEN status = 'ENTREGADO' THEN 1 ELSE 0 END) as entregados,
         SUM(CASE WHEN status = 'RECHAZADO' THEN 1 ELSE 0 END) as rechazados,
         SUM(CASE WHEN status = 'APROBADO' THEN 1 ELSE 0 END) as aprobados,
-        SUM(CASE WHEN status = 'PENDIENTE_REGULARIZACION' THEN 1 ELSE 0 END) as pendientes_regularizacion,
-        SUM(CASE WHEN status = 'CERRADO' THEN 1 ELSE 0 END) as cerrados,
-        SUM(CASE WHEN status IN ('ASIGNADO', 'EN_EJECUCION') THEN 1 ELSE 0 END) as pending_presentation,
-        SUM(CASE WHEN status != 'CERRADO' AND scheduled_date < date('now') THEN 1 ELSE 0 END) as overdue_counts
+        SUM(CASE WHEN status = 'APROBADO' AND EXISTS (
+          SELECT 1 FROM count_items ci_p
+          WHERE ci_p.count_id = counts.id
+            AND (ci_p.is_not_counted = 1 OR ci_p.reconciliation_result IN ('FALTANTE', 'SOBRANTE'))
+            AND ci_p.adjustment_status = 'PENDIENTE'
+        ) THEN 1 ELSE 0 END) as aprobados_pendientes_reg,
+        SUM(CASE WHEN status != 'APROBADO' AND scheduled_date < date('now') THEN 1 ELSE 0 END) as overdue_counts
        FROM counts`
     )
     .get() as Record<string, number>;
+
+  const aprobadosTotalLive = Number(liveCounts.aprobados || 0);
+  const aprobadosPendientesRegLive = Number(liveCounts.aprobados_pendientes_reg || 0);
+  const aprobadosRegularizadosLive = Math.max(0, aprobadosTotalLive - aprobadosPendientesRegLive);
 
   const activeStockUnits = (
     db.prepare('SELECT COALESCE(SUM(available_stock), 0) as units FROM inventory_balances').get() as {
       units: number;
     }
   ).units;
-
-  const userDailySales = db
-    .prepare(
-      `SELECT
-        COUNT(DISTINCT po.id) as sales_count,
-        COALESCE(SUM(po.total), 0) as sales_total,
-        COALESCE((
-          SELECT SUM(poi.quantity)
-          FROM pos_operation_items poi
-          JOIN pos_operations po2 ON po2.id = poi.operation_id
-          WHERE po2.created_by_user_id = ?
-            AND po2.operation_type = 'VENTA'
-            AND po2.status = 'CONFIRMADA'
-            AND date(po2.created_at) = date('now')
-        ), 0) as sales_units
-       FROM pos_operations po
-       WHERE po.created_by_user_id = ?
-         AND po.operation_type = 'VENTA'
-         AND po.status = 'CONFIRMADA'
-         AND date(po.created_at) = date('now')`
-    )
-    .get(req.user!.id, req.user!.id) as {
-    sales_count: number;
-    sales_total: number;
-    sales_units: number;
-  };
-
-  const teamDailySales = db
-    .prepare(
-      `SELECT COALESCE(SUM(total), 0) as sales_total, COUNT(*) as sales_count
-       FROM pos_operations
-       WHERE operation_type = 'VENTA'
-         AND status = 'CONFIRMADA'
-         AND date(created_at) = date('now')`
-    )
-    .get() as { sales_total: number; sales_count: number };
 
   const trackingAlerts: Array<{
     key: string;
@@ -5173,51 +4568,49 @@ app.get(
       targetTab: 'management',
     });
   }
-  if (Number(liveCounts.pendientes_aprobacion || 0) > 0) {
+  if (Number(liveCounts.entregados || 0) > 0) {
     trackingAlerts.push({
       key: 'pending_approval',
       severity: 'ALTA',
-      title: `${liveCounts.pendientes_aprobacion} conteo(s) pendiente(s) de aprobación por Control de Stock`,
-      count: Number(liveCounts.pendientes_aprobacion || 0),
+      title: `${liveCounts.entregados} conteo(s) entregado(s) pendiente(s) de aprobación por Control de Stock`,
+      count: Number(liveCounts.entregados || 0),
       targetTab: 'validation',
-      filterStatus: CountStatus.PENDIENTE_APROBACION,
+      filterStatus: CountStatus.ENTREGADO,
     });
   }
   if (Number(liveCounts.rechazados || 0) > 0) {
     trackingAlerts.push({
       key: 'rejected',
       severity: 'ALTA',
-      title: `${liveCounts.rechazados} conteo(s) rechazado(s) sin resolver ni re-presentar`,
+      title: `${liveCounts.rechazados} conteo(s) rechazado(s) pendiente(s) de reapertura y corrección`,
       count: Number(liveCounts.rechazados || 0),
       targetTab: 'management',
       filterStatus: CountStatus.RECHAZADO,
     });
   }
-  if (Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0) > 0) {
-    const regPending = Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0);
+  if (aprobadosPendientesRegLive > 0) {
     trackingAlerts.push({
       key: 'pending_regularization',
       severity: 'MEDIA',
-      title: `${regPending} conteo(s) aprobado(s) pendiente(s) de regularización o cierre`,
-      count: regPending,
+      title: `${aprobadosPendientesRegLive} conteo(s) aprobado(s) con regularización ERP pendiente de documentar`,
+      count: aprobadosPendientesRegLive,
       targetTab: 'validation',
+      filterStatus: CountStatus.APROBADO,
     });
   }
-  if (Number(liveCounts.pending_presentation || 0) > 0) {
+  if (Number(liveCounts.en_ejecucion || 0) > 0) {
     trackingAlerts.push({
-      key: 'pending_presentation',
+      key: 'pending_execution',
       severity: 'MEDIA',
-      title: `${liveCounts.pending_presentation} conteo(s) asignado(s) o en ejecución pendiente(s) de presentación`,
-      count: Number(liveCounts.pending_presentation || 0),
+      title: `${liveCounts.en_ejecucion} conteo(s) en ejecución pendiente(s) de entrega`,
+      count: Number(liveCounts.en_ejecucion || 0),
       targetTab: 'management',
+      filterStatus: CountStatus.EJECUCION,
     });
   }
-
-  const programadosCompat = Number(liveCounts.borradores || 0) + Number(liveCounts.asignados || 0);
-  const aprobAndRegLive = Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0);
 
   // Active counts grouped by Counter (Contadores) for executive supervision
-  const activeScopeConds: string[] = ["c.status != 'CERRADO'"];
+  const activeScopeConds: string[] = ["c.status != 'APROBADO'"];
   const activeScopeParams: unknown[] = [];
   if (locationId) {
     activeScopeConds.push('c.location_id = ?');
@@ -5267,12 +4660,9 @@ app.get(
     role: string;
     assignedLocationsLabel: string;
     totalActive: number;
-    draftCount: number;
-    assignedCount: number;
     inExecutionCount: number;
-    pendingApprovalCount: number;
+    deliveredCount: number;
     rejectedCount: number;
-    regularizationCount: number;
     overdueCount: number;
     counts: Array<{
       id: number;
@@ -5311,12 +4701,9 @@ app.get(
       role: String(cu.role),
       assignedLocationsLabel,
       totalActive: 0,
-      draftCount: 0,
-      assignedCount: 0,
       inExecutionCount: 0,
-      pendingApprovalCount: 0,
+      deliveredCount: 0,
       rejectedCount: 0,
-      regularizationCount: 0,
       overdueCount: 0,
       counts: [],
     });
@@ -5328,17 +4715,14 @@ app.get(
     if (!counterBucketsMap.has(key)) {
       counterBucketsMap.set(key, {
         counterId: cid,
-        counterName: cid !== null ? String(r.counter_name) : 'Sin contador asignado (Borradores)',
+        counterName: cid !== null ? String(r.counter_name) : 'Sin contador asignado',
         counterUsername: cid !== null ? String(r.counter_username) : '',
         role: cid !== null ? String(r.counter_role || 'JEFE_STOCK') : 'SIN_ASIGNAR',
         assignedLocationsLabel: cid !== null ? 'Supervisión / Jefatura' : 'Pendiente de asignación',
         totalActive: 0,
-        draftCount: 0,
-        assignedCount: 0,
         inExecutionCount: 0,
-        pendingApprovalCount: 0,
+        deliveredCount: 0,
         rejectedCount: 0,
-        regularizationCount: 0,
         overdueCount: 0,
         counts: [],
       });
@@ -5347,14 +4731,9 @@ app.get(
     const st = String(r.status) as CountStatus;
     const isOverdue = Boolean(r.is_overdue);
     bucket.totalActive += 1;
-    if (st === CountStatus.BORRADOR) bucket.draftCount += 1;
-    else if (st === CountStatus.ASIGNADO) bucket.assignedCount += 1;
-    else if (st === CountStatus.EN_EJECUCION) bucket.inExecutionCount += 1;
-    else if (st === CountStatus.PENDIENTE_APROBACION) bucket.pendingApprovalCount += 1;
+    if (st === CountStatus.EJECUCION) bucket.inExecutionCount += 1;
+    else if (st === CountStatus.ENTREGADO) bucket.deliveredCount += 1;
     else if (st === CountStatus.RECHAZADO) bucket.rejectedCount += 1;
-    else if (st === CountStatus.APROBADO || st === CountStatus.PENDIENTE_REGULARIZACION) {
-      bucket.regularizationCount += 1;
-    }
     if (isOverdue) bucket.overdueCount += 1;
 
     bucket.counts.push({
@@ -5374,9 +4753,9 @@ app.get(
     (a, b) => b.totalActive - a.totalActive || a.counterName.localeCompare(b.counterName, 'es')
   );
 
-  // Planned counts pending within the current calendar month
+  // Planned counts pending approval within the current calendar month
   const monthlyConds: string[] = [
-    "c.status != 'CERRADO'",
+    "c.status != 'APROBADO'",
     "strftime('%Y-%m', c.scheduled_date) = strftime('%Y-%m', 'now')",
   ];
   const monthlyParams: unknown[] = [];
@@ -5405,25 +4784,27 @@ app.get(
     )
     .all(...monthlyParams);
 
-  // Closed counts (Conteos ya cerrados / finalizados)
-  const closedConds: string[] = ["c.status = 'CERRADO'", ...countConds];
-  const closedParams: unknown[] = [...countParams];
+  // Approved counts & ERP regularization tracking
+  const approvedConds: string[] = ["c.status = 'APROBADO'", ...countConds];
+  const approvedParams: unknown[] = [...countParams];
   if (skuFilter) {
-    closedConds.push(
+    approvedConds.push(
       'EXISTS (SELECT 1 FROM count_items ci_f JOIN products p_f ON p_f.id = ci_f.product_id WHERE ci_f.count_id = c.id AND p_f.sku LIKE ?)'
     );
-    closedParams.push(`%${skuFilter}%`);
+    approvedParams.push(`%${skuFilter}%`);
   }
 
   const closedCounts = db
     .prepare(
       `SELECT c.id, c.count_number, l.name as location_name, l.group_type as location_group,
         COALESCE(uc.full_name, 'Sin asignar') as counter_name,
-        c.scheduled_date, c.closed_at, c.chief_signature_name,
-        COALESCE(ucl.full_name, c.chief_signature_name, 'Jefatura') as closed_by_name,
+        c.scheduled_date, COALESCE(c.approved_at, c.validated_at, c.closed_at) as approved_at, c.chief_signature_name,
+        COALESCE(ua.full_name, c.chief_signature_name, 'Jefatura') as approved_by_name,
+        CASE WHEN strftime('%Y-%m', COALESCE(c.approved_at, c.validated_at, c.closed_at, c.scheduled_date)) = strftime('%Y-%m', 'now') THEN 1 ELSE 0 END as is_current_month,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id) as items_count,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result = 'COINCIDENCIA') as matches_count,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE')) as discrepancies_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND (ci.is_not_counted = 1 OR ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE')) AND ci.adjustment_status = 'PENDIENTE') as pending_reg_items_count,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.adjustment_status IN ('AJUSTE', 'MOVIMIENTO')) as adjusted_items_count,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.adjustment_status = 'SIN_AJUSTE') as no_adjustment_items_count,
         COALESCE((SELECT SUM(CASE WHEN ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE') AND ci.snapshot_cost_price IS NOT NULL THEN ci.difference * ci.snapshot_cost_price ELSE 0 END) FROM count_items ci WHERE ci.count_id = c.id), 0) as net_economic_diff,
@@ -5431,40 +4812,44 @@ app.get(
        FROM counts c
        JOIN locations l ON l.id = c.location_id
        LEFT JOIN users uc ON uc.id = c.assigned_counter_id
-       LEFT JOIN users ucl ON ucl.id = c.closed_by_user_id
-       WHERE ${closedConds.join(' AND ')}
-       ORDER BY COALESCE(c.closed_at, c.updated_at, c.created_at) DESC, c.id DESC
+       LEFT JOIN users ua ON ua.id = COALESCE(c.approved_by_user_id, c.closed_by_user_id)
+       WHERE ${approvedConds.join(' AND ')}
+       ORDER BY COALESCE(c.approved_at, c.validated_at, c.closed_at, c.updated_at, c.created_at) DESC, c.id DESC
        LIMIT 50`
     )
-    .all(...closedParams);
+    .all(...approvedParams);
+
+  const monthlyApprovedRow = db
+    .prepare(
+      `SELECT COUNT(*) as cnt
+       FROM counts c
+       WHERE ${approvedConds.join(' AND ')}
+         AND strftime('%Y-%m', COALESCE(c.approved_at, c.validated_at, c.closed_at, c.scheduled_date)) = strftime('%Y-%m', 'now')`
+    )
+    .get(...approvedParams) as { cnt: number };
 
   const currentMonth = new Date().toISOString().slice(0, 7);
 
   res.json({
     quickMetrics: {
       activeInventoryCounts: Number(liveCounts.active_counts || 0),
-      programados: programadosCompat,
-      enProgreso: Number(liveCounts.en_ejecucion || 0),
-      reconteos: Number(liveCounts.rechazados || 0),
+      enEjecucion: Number(liveCounts.en_ejecucion || 0),
+      entregados: Number(liveCounts.entregados || 0),
+      rechazados: Number(liveCounts.rechazados || 0),
+      aprobados: aprobadosTotalLive,
+      aprobadosPendientesReg: aprobadosPendientesRegLive,
+      aprobadosRegularizados: aprobadosRegularizadosLive,
       activeStockUnits: Number(activeStockUnits || 0),
-      pendingValidations: Number(liveCounts.pendientes_aprobacion || 0),
-      awaitingClosure: aprobAndRegLive,
-      userDailySalesAmount: Number(userDailySales.sales_total || 0),
-      userDailySalesCount: Number(userDailySales.sales_count || 0),
-      userDailySalesUnits: Number(userDailySales.sales_units || 0),
-      teamDailySalesAmount: Number(teamDailySales.sales_total || 0),
-      teamDailySalesCount: Number(teamDailySales.sales_count || 0),
+      monthlyApprovedCounts: Number(monthlyApprovedRow.cnt || 0),
     },
     workflowSummary: {
       totalCreated: Number(liveCounts.total_created || 0),
-      borradores: Number(liveCounts.borradores || 0),
-      asignados: Number(liveCounts.asignados || 0),
       enEjecucion: Number(liveCounts.en_ejecucion || 0),
-      pendientesAprobacion: Number(liveCounts.pendientes_aprobacion || 0),
+      entregados: Number(liveCounts.entregados || 0),
       rechazados: Number(liveCounts.rechazados || 0),
-      aprobados: Number(liveCounts.aprobados || 0),
-      pendientesRegularizacion: Number(liveCounts.pendientes_regularizacion || 0),
-      cerrados: Number(liveCounts.cerrados || 0),
+      aprobados: aprobadosTotalLive,
+      aprobadosPendientesReg: aprobadosPendientesRegLive,
+      aprobadosRegularizados: aprobadosRegularizadosLive,
       overdueCounts: Number(liveCounts.overdue_counts || 0),
     },
     trackingAlerts,
@@ -5476,21 +4861,13 @@ app.get(
       totalProducts,
       totalLocations,
       total_counts: Number(countStats.total_counts || 0),
-      programados: Number(countStats.borradores || 0) + Number(countStats.asignados || 0),
-      en_progreso: Number(countStats.en_ejecucion || 0),
-      en_revision: Number(countStats.pendientes_aprobacion || 0) + Number(countStats.rechazados || 0),
-      validados: Number(countStats.aprobados || 0) + Number(countStats.pendientes_regularizacion || 0),
-      cerrados: Number(countStats.cerrados || 0),
+      en_ejecucion: Number(countStats.en_ejecucion || 0),
+      entregados: Number(countStats.entregados || 0),
+      rechazados: Number(countStats.rechazados || 0),
+      aprobados: Number(countStats.aprobados || 0),
       compliancePct:
         countStats.total_counts > 0
-          ? Math.round(
-              (((countStats.aprobados || 0) +
-                (countStats.pendientes_regularizacion || 0) +
-                (countStats.cerrados || 0) +
-                (countStats.pendientes_aprobacion || 0)) /
-                countStats.total_counts) *
-                1000
-            ) / 10
+          ? Math.round(((countStats.aprobados || 0) / countStats.total_counts) * 1000) / 10
           : 0,
     },
     discrepancies: {
@@ -5594,8 +4971,6 @@ const BACKUP_TABLES_ORDER = [
   'count_state_history',
   'count_submissions',
   'attachments',
-  'pos_operations',
-  'pos_operation_items',
   'notifications',
   'audit_events',
 ] as const;
@@ -5720,6 +5095,11 @@ function verifyBackupStructure(raw: unknown): {
   if (obj.integrity?.missingAttachments && obj.integrity.missingAttachments.length > 0) {
     warnings.push(
       `Al momento de exportar faltaban ${obj.integrity.missingAttachments.length} archivo(s) físico(s) en disco.`
+    );
+  }
+  if ('pos_operations' in tables || 'pos_operation_items' in tables) {
+    warnings.push(
+      'El respaldo proviene de una versión anterior con tablas POS legadas; dichas tablas serán omitidas al restaurar.'
     );
   }
 
@@ -5926,8 +5306,22 @@ app.post(
       fs.writeFileSync(targetPath, Buffer.from(af.contentBase64, 'base64'));
     }
 
+    const tableColumnsCache = new Map<string, Set<string>>();
+    const getTableColumns = (table: string): Set<string> => {
+      const cached = tableColumnsCache.get(table);
+      if (cached) return cached;
+      const cols = new Set(
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+          (c) => c.name
+        )
+      );
+      tableColumnsCache.set(table, cols);
+      return cols;
+    };
+
     const insertRow = (table: string, row: Record<string, unknown>): void => {
-      const cols = Object.keys(row);
+      const allowedCols = getTableColumns(table);
+      const cols = Object.keys(row).filter((c) => allowedCols.has(c));
       if (cols.length === 0) return;
       const placeholders = cols.map(() => '?').join(',');
       db.prepare(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`).run(
@@ -5942,6 +5336,25 @@ app.post(
           db.prepare(`DELETE FROM ${t}`).run();
         }
         db.prepare('DELETE FROM sqlite_sequence').run();
+
+        const mapLegacyRestoredStatus = (rawSt: unknown): string => {
+          const st = String(rawSt || '').trim().toUpperCase();
+          if (st === 'PENDIENTE_APROBACION' || st === 'ENVIADO_REVISION' || st === 'ENTREGADO') {
+            return CountStatus.ENTREGADO;
+          }
+          if (st === 'RECHAZADO' || st === 'RECONTEO_SOLICITADO') {
+            return CountStatus.RECHAZADO;
+          }
+          if (
+            st === 'APROBADO' ||
+            st === 'PENDIENTE_REGULARIZACION' ||
+            st === 'CERRADO' ||
+            st === 'VALIDADO'
+          ) {
+            return CountStatus.APROBADO;
+          }
+          return CountStatus.EJECUCION;
+        };
 
         for (const t of BACKUP_TABLES_ORDER) {
           const rows = backup.tables[t] || [];
@@ -5960,6 +5373,16 @@ app.post(
                 token_version: Number(rawRow.token_version ?? 1) + 1,
               };
               insertRow('users', restoredUserRow);
+            } else if (t === 'counts') {
+              insertRow('counts', {
+                ...rawRow,
+                status: mapLegacyRestoredStatus(rawRow.status),
+              });
+            } else if (t === 'count_submissions') {
+              insertRow('count_submissions', {
+                ...rawRow,
+                outcome_status: mapLegacyRestoredStatus(rawRow.outcome_status),
+              });
             } else {
               insertRow(t, rawRow);
             }

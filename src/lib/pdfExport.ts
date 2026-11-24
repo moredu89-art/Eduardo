@@ -199,82 +199,6 @@ export async function exportBlindCountSheetPdf(data: BlindSheetPdfData): Promise
   doc.save(`Planilla_Ciega_MercoMat_${data.countNumber}.pdf`);
 }
 
-export async function exportPosVoucherPdf(op: {
-  operation_number: string;
-  operation_type: string;
-  status: string;
-  location_name: string;
-  customer_name: string;
-  customer_doc: string;
-  created_at: string;
-  created_by_name: string;
-  total: number;
-  notes: string;
-  items: Array<{
-    sku: string;
-    description: string;
-    quantity: number;
-    unit_price: number;
-    line_total: number;
-  }>;
-}): Promise<void> {
-  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-  const logoData = await loadLogoBase64();
-
-  if (logoData) {
-    doc.addImage(logoData, 'JPEG', 14, 10, 14, 14);
-  }
-
-  doc.setTextColor(142, 13, 13);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13);
-  doc.text('MercoMat — Comprobante Interno de Operación POS', logoData ? 32 : 14, 16);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
-  doc.setTextColor(180, 83, 9);
-  doc.text(
-    'DOCUMENTO INTERNO DE CONTROL — NO VÁLIDO COMO FACTURA FISCAL',
-    logoData ? 32 : 14,
-    21.5
-  );
-
-  doc.setTextColor(15, 23, 42);
-  doc.setFontSize(9.5);
-  doc.text(`Nro. Operación: ${op.operation_number}   |   Tipo: ${op.operation_type}   |   Estado: ${op.status}`, 14, 32);
-  doc.text(`Ubicación: ${op.location_name}   |   Fecha: ${op.created_at}`, 14, 38);
-  doc.text(`Cliente: ${op.customer_name} (${op.customer_doc || 'S/D'})   |   Operador: ${op.created_by_name}`, 14, 44);
-
-  autoTable(doc, {
-    startY: 50,
-    head: [['Código', 'Artículo', 'Cantidad', 'Precio Unit.', 'Subtotal']],
-    body: op.items.map((it) => [
-      it.sku,
-      it.description,
-      String(it.quantity),
-      `$${Number(it.unit_price).toLocaleString('es-AR', { minimumFractionDigits: 2 })}`,
-      `$${Number(it.line_total).toLocaleString('es-AR', { minimumFractionDigits: 2 })}`,
-    ]),
-    styles: { fontSize: 9 },
-    headStyles: { fillColor: [142, 13, 13], textColor: [255, 255, 255] },
-  });
-
-  const finalY = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY || 120;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.text(
-    `Total Operación: $${Number(op.total).toLocaleString('es-AR', { minimumFractionDigits: 2 })}`,
-    14,
-    finalY + 12
-  );
-  if (op.notes) {
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.text(`Observaciones: ${op.notes}`, 14, finalY + 20);
-  }
-
-  doc.save(`Comprobante_MercoMat_${op.operation_number}.pdf`);
-}
-
 export interface ExecutiveSummaryPdfData {
   generatedBy: string;
   filtersSummary: {
@@ -286,26 +210,23 @@ export interface ExecutiveSummaryPdfData {
   };
   quickMetrics: {
     activeInventoryCounts: number;
-    programados: number;
-    enProgreso: number;
-    reconteos: number;
+    enEjecucion: number;
+    entregados: number;
+    rechazados: number;
+    aprobados: number;
+    aprobadosPendientesReg: number;
+    aprobadosRegularizados: number;
     activeStockUnits: number;
-    pendingValidations: number;
-    awaitingClosure: number;
-    userDailySalesAmount: number;
-    userDailySalesCount: number;
-    userDailySalesUnits: number;
-    teamDailySalesAmount: number;
+    monthlyApprovedCounts?: number;
   };
   general: {
     totalProducts: number;
     totalLocations: number;
     total_counts: number;
-    programados: number;
-    en_progreso: number;
-    en_revision: number;
-    validados: number;
-    cerrados: number;
+    en_ejecucion: number;
+    entregados: number;
+    rechazados: number;
+    aprobados: number;
     compliancePct: number;
   };
   discrepancies: {
@@ -372,7 +293,7 @@ export async function exportExecutiveSummaryPdf(data: ExecutiveSummaryPdfData): 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
   doc.setTextColor(71, 85, 105);
-  doc.text('REPORTE GERENCIAL DE COBERTURA, CONFIABILIDAD, DIFERENCIAS Y VENTAS', 33, 21.5);
+  doc.text('REPORTE GERENCIAL DE COBERTURA, CONFIABILIDAD Y DIFERENCIAS DE STOCK', 33, 21.5);
 
   doc.setDrawColor(142, 13, 13);
   doc.setLineWidth(0.7);
@@ -436,19 +357,19 @@ export async function exportExecutiveSummaryPdf(data: ExecutiveSummaryPdfData): 
     head: [['Indicador Clave', 'Valor Actual', 'Detalle / Desglose']],
     body: [
       [
-        'Conteos de Inventario Activos',
+        'Conteos Activos (Ejecución / Rechazado)',
         String(data.quickMetrics.activeInventoryCounts),
-        `${data.quickMetrics.programados} programados · ${data.quickMetrics.enProgreso} en progreso · ${data.quickMetrics.reconteos} reconteo · ${data.quickMetrics.activeStockUnits.toLocaleString('es-AR')} u. disp.`,
+        `${data.quickMetrics.enEjecucion} en ejecución · ${data.quickMetrics.rechazados} rechazados · ${data.quickMetrics.activeStockUnits.toLocaleString('es-AR')} u. disp.`,
       ],
       [
-        'Validaciones Pendientes',
-        String(data.quickMetrics.pendingValidations),
-        `${data.quickMetrics.pendingValidations} esperando revisión · ${data.quickMetrics.awaitingClosure} validado(s) por cerrar`,
+        'Conteos Entregados (Pendientes de Revisión)',
+        String(data.quickMetrics.entregados),
+        `${data.quickMetrics.entregados} esperando revisión · ${data.quickMetrics.aprobadosPendientesReg} aprobado(s) con ajuste ERP pendiente`,
       ],
       [
-        'Ventas Diarias del Usuario',
-        `$${data.quickMetrics.userDailySalesAmount.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-        `${data.quickMetrics.userDailySalesCount} venta(s) · ${data.quickMetrics.userDailySalesUnits} u. hoy · Global hoy: $${data.quickMetrics.teamDailySalesAmount.toLocaleString('es-AR', { maximumFractionDigits: 0 })}`,
+        'Conteos Aprobados en el Mes',
+        String(data.quickMetrics.monthlyApprovedCounts ?? 0),
+        `${data.quickMetrics.aprobados} aprobados acumulados · ${data.quickMetrics.aprobadosRegularizados} regularizados en seguimiento ERP`,
       ],
       [
         'Artículos / Ubicaciones Activas',
@@ -458,9 +379,9 @@ export async function exportExecutiveSummaryPdf(data: ExecutiveSummaryPdfData): 
           : 'Almacén Maestro centralizado activo',
       ],
       [
-        'Cumplimiento del Plan de Conteos',
+        'Cumplimiento del Plan (Aprobados)',
         `${data.general.compliancePct}%`,
-        `${data.general.cerrados || 0} cerrados · ${data.general.validados || 0} validados · ${data.general.en_revision || 0} en revisión`,
+        `${data.general.aprobados || 0} aprobados · ${data.general.entregados || 0} entregados · ${data.general.en_ejecucion || 0} en ejecución · ${data.general.rechazados || 0} rechazados`,
       ],
       [
         'Confiabilidad ERP vs Físico',
@@ -571,7 +492,7 @@ export async function exportExecutiveSummaryPdf(data: ExecutiveSummaryPdfData): 
     doc.setFontSize(7.5);
     doc.setTextColor(100, 116, 139);
     doc.text(
-      `MercoMat — Reporte Ejecutivo de Control de Inventarios y POS   |   Página ${i} de ${pageCount}`,
+      `MercoMat — Reporte Ejecutivo de Control de Stock   |   Página ${i} de ${pageCount}`,
       14,
       289
     );

@@ -12,7 +12,6 @@ const COLUMN_SYNONYMS: Record<keyof ExcelColumnMapping, string[]> = {
   erpStock: ['existencia', 'stock', 'stock_fisico', 'existencia_erp', 'cantidad', 'saldo', 'stock erp', 'existencias'],
   location: ['deposito', 'depósito', 'ubicacion', 'ubicación', 'sucursal', 'almacen', 'almacén', 'bodega'],
   costPrice: ['costo', 'precio_costo', 'costo_unitario', 'cost', 'valor_costo'],
-  salePrice: ['precio', 'precio_venta', 'precio de venta', 'pvp', 'venta', 'price'],
   committedStock: ['comprometido', 'stock comprometido', 'reservado', 'stock_comprometido', 'pedidos'],
   criticality: ['criticidad', 'prioridad', 'criticality'],
 };
@@ -98,7 +97,6 @@ export interface ValidationPreviewResult {
     committedStock: number;
     availableCalculated: number;
     costPrice: number | null;
-    salePrice: number | null;
     isNewProduct: boolean;
   }>;
 }
@@ -177,7 +175,6 @@ export function validateExcelRows(
       ? parseNumberField(row[mapping.committedStock]) ?? 0
       : 0;
     const costPrice = mapping.costPrice ? parseNumberField(row[mapping.costPrice]) : null;
-    const salePrice = mapping.salePrice ? parseNumberField(row[mapping.salePrice]) : null;
 
     let rowHasError = false;
 
@@ -306,7 +303,6 @@ export function validateExcelRows(
         committedStock: safeCommitted,
         availableCalculated: Math.max(0, safeStock - safeCommitted),
         costPrice,
-        salePrice,
         isNewProduct: sku ? !existingSkus.has(sku.toUpperCase()) : false,
       });
     }
@@ -364,8 +360,8 @@ export function commitExcelImport(params: {
   const insertProd = db.prepare(`
     INSERT INTO products (
       sku, description, alias, family, brand, unit_of_measure,
-      cost_price, sale_price, criticality_level, extra_attributes_json, last_erp_sync_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      cost_price, criticality_level, extra_attributes_json, last_erp_sync_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateProd = db.prepare(`
     UPDATE products SET
@@ -375,7 +371,6 @@ export function commitExcelImport(params: {
       brand = CASE WHEN ? != '' THEN ? ELSE brand END,
       unit_of_measure = CASE WHEN ? != '' THEN ? ELSE unit_of_measure END,
       cost_price = COALESCE(?, cost_price),
-      sale_price = COALESCE(?, sale_price),
       criticality_level = COALESCE(?, criticality_level),
       extra_attributes_json = ?,
       last_erp_sync_at = ?,
@@ -396,7 +391,7 @@ export function commitExcelImport(params: {
     UPDATE inventory_balances SET
       erp_physical_stock = ?,
       committed_stock = ?,
-      available_stock = MAX(0, ? - ? - review_stock - damaged_stock - pos_pending_sync),
+      available_stock = MAX(0, ? - ? - review_stock - damaged_stock),
       last_import_batch_id = ?,
       last_erp_updated_at = ?,
       updated_at = datetime('now')
@@ -465,7 +460,6 @@ export function commitExcelImport(params: {
       const brand = params.mapping.brand ? String(row[params.mapping.brand] ?? '').trim() : '';
       const uom = params.mapping.unitOfMeasure ? String(row[params.mapping.unitOfMeasure] ?? '').trim() : '';
       const costPrice = params.mapping.costPrice ? parseNumberField(row[params.mapping.costPrice]) : null;
-      const salePrice = params.mapping.salePrice ? parseNumberField(row[params.mapping.salePrice]) : null;
       const rawCommitted = params.mapping.committedStock
         ? parseNumberField(row[params.mapping.committedStock])
         : null;
@@ -499,7 +493,6 @@ export function commitExcelImport(params: {
           brand || 'Sin marca',
           uom || 'UN',
           costPrice,
-          salePrice,
           criticality || CriticalityLevel.MEDIA,
           JSON.stringify(extraAttrs),
           params.cutoffTimestamp
@@ -525,7 +518,6 @@ export function commitExcelImport(params: {
           uom,
           uom,
           costPrice,
-          salePrice,
           criticality,
           JSON.stringify(mergedExtra),
           params.cutoffTimestamp,
@@ -641,7 +633,6 @@ export function buildExcelTemplateBuffer(): Buffer {
       'Existencia': 0,
       'Stock comprometido': 0,
       'Costo': 0,
-      'Precio de venta': 0,
       'Criticidad': 'MEDIA',
     },
   ];
@@ -657,7 +648,6 @@ export function buildExcelTemplateBuffer(): Buffer {
     { wch: 12 },
     { wch: 18 },
     { wch: 12 },
-    { wch: 15 },
     { wch: 14 },
   ];
 

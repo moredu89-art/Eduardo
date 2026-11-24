@@ -177,7 +177,6 @@ export function initDatabase(): void {
       brand TEXT NOT NULL DEFAULT 'Sin marca',
       unit_of_measure TEXT NOT NULL DEFAULT 'UN',
       cost_price REAL NULL,
-      sale_price REAL NULL,
       criticality_level TEXT NOT NULL DEFAULT 'MEDIA' CHECK(criticality_level IN ('ALTA', 'MEDIA', 'BAJA')),
       extra_attributes_json TEXT NOT NULL DEFAULT '{}',
       last_erp_sync_at TEXT NULL,
@@ -193,7 +192,6 @@ export function initDatabase(): void {
       committed_stock REAL NOT NULL DEFAULT 0,
       review_stock REAL NOT NULL DEFAULT 0,
       damaged_stock REAL NOT NULL DEFAULT 0,
-      pos_pending_sync REAL NOT NULL DEFAULT 0,
       available_stock REAL NOT NULL DEFAULT 0,
       last_import_batch_id INTEGER NULL,
       last_erp_updated_at TEXT NULL,
@@ -258,9 +256,8 @@ export function initDatabase(): void {
       assigned_counter_id INTEGER NULL,
       warehouse_manager_id INTEGER NULL,
       created_by_user_id INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'BORRADOR' CHECK(status IN (
-        'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
-        'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
+      status TEXT NOT NULL DEFAULT 'EJECUCION' CHECK(status IN (
+        'EJECUCION', 'ENTREGADO', 'APROBADO', 'RECHAZADO'
       )),
       weekly_goal_tag TEXT NOT NULL DEFAULT '',
       blind_printed_at TEXT NULL,
@@ -360,7 +357,7 @@ export function initDatabase(): void {
       warehouse_signature_name TEXT NOT NULL DEFAULT '',
       general_observations TEXT NOT NULL DEFAULT '',
       items_snapshot_json TEXT NOT NULL,
-      outcome_status TEXT NOT NULL DEFAULT 'PENDIENTE_APROBACION',
+      outcome_status TEXT NOT NULL DEFAULT 'ENTREGADO',
       reviewed_by_user_id INTEGER NULL,
       reviewed_by_username TEXT NOT NULL DEFAULT '',
       review_notes TEXT NOT NULL DEFAULT '',
@@ -383,39 +380,6 @@ export function initDatabase(): void {
       uploaded_by_user_id INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (uploaded_by_user_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS pos_operations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      operation_number TEXT NOT NULL UNIQUE,
-      operation_type TEXT NOT NULL CHECK(operation_type IN ('VENTA', 'RESERVA', 'DEVOLUCION')),
-      location_id INTEGER NOT NULL,
-      customer_name TEXT NOT NULL DEFAULT 'Consumidor Final',
-      customer_doc TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'CONFIRMADA' CHECK(status IN ('PENDIENTE', 'CONFIRMADA', 'ANULADA')),
-      subtotal REAL NOT NULL DEFAULT 0,
-      total REAL NOT NULL DEFAULT 0,
-      notes TEXT NOT NULL DEFAULT '',
-      erp_sync_status TEXT NOT NULL DEFAULT 'MODULO_INDEPENDIENTE_LOCAL',
-      created_by_user_id INTEGER NOT NULL,
-      voided_by_user_id INTEGER NULL,
-      void_reason TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-      FOREIGN KEY (location_id) REFERENCES locations(id),
-      FOREIGN KEY (created_by_user_id) REFERENCES users(id),
-      FOREIGN KEY (voided_by_user_id) REFERENCES users(id) ON DELETE SET NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS pos_operation_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      operation_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity REAL NOT NULL,
-      unit_price REAL NOT NULL,
-      line_total REAL NOT NULL,
-      FOREIGN KEY (operation_id) REFERENCES pos_operations(id) ON DELETE CASCADE,
-      FOREIGN KEY (product_id) REFERENCES products(id)
     );
 
     CREATE TABLE IF NOT EXISTS notifications (
@@ -442,16 +406,60 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
   `);
 
-  // Idempotent migration: upgrade legacy 6-state counts table to 8-state schema & nullable assigned_counter_id
+  // Idempotent migration: upgrade legacy 6-state or 8-state counts table to 4-state schema (EJECUCION, ENTREGADO, APROBADO, RECHAZADO)
   const countsSqlRow = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'counts'")
     .get() as { sql?: string } | undefined;
 
-  if (countsSqlRow?.sql && !countsSqlRow.sql.includes("'PENDIENTE_APROBACION'")) {
+  if (countsSqlRow?.sql && !countsSqlRow.sql.includes("'ENTREGADO'")) {
+    const pre4StateBackupPath = `${DB_PATH}.pre-4state-migration.bak`;
+    if (fs.existsSync(DB_PATH) && !fs.existsSync(pre4StateBackupPath)) {
+      try {
+        fs.copyFileSync(DB_PATH, pre4StateBackupPath);
+      } catch {
+        // non-fatal if filesystem copy fails
+      }
+    }
+
     const oldCols = (db.prepare('PRAGMA table_info(counts)').all() as Array<{ name: string }>).map(
       (c) => c.name
     );
     const hasCol = (name: string) => oldCols.includes(name);
+    const colExpr = (name: string, fallbackSql: string) => (hasCol(name) ? name : fallbackSql);
+
+    const mapLegacyStatus = (st: string): 'EJECUCION' | 'ENTREGADO' | 'APROBADO' | 'RECHAZADO' => {
+      switch (st) {
+        case 'PENDIENTE_APROBACION':
+        case 'ENVIADO_REVISION':
+          return 'ENTREGADO';
+        case 'RECHAZADO':
+        case 'RECONTEO_SOLICITADO':
+          return 'RECHAZADO';
+        case 'APROBADO':
+        case 'PENDIENTE_REGULARIZACION':
+        case 'CERRADO':
+        case 'VALIDADO':
+          return 'APROBADO';
+        case 'BORRADOR':
+        case 'ASIGNADO':
+        case 'EN_EJECUCION':
+        case 'PROGRAMADO':
+        case 'EN_PROGRESO':
+        default:
+          return 'EJECUCION';
+      }
+    };
+
+    const preMigrationCounts = db
+      .prepare('SELECT id, status, location_id FROM counts')
+      .all() as Array<{ id: number; status: string; location_id: number }>;
+    const preHistCount = (
+      db.prepare('SELECT COUNT(*) as cnt FROM count_state_history').get() as { cnt: number }
+    ).cnt;
+
+    const approvedAtExpr = hasCol('approved_at')
+      ? "COALESCE(approved_at, CASE WHEN status IN ('APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO', 'VALIDADO') THEN COALESCE(validated_at, closed_at) ELSE NULL END)"
+      : "CASE WHEN status IN ('APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO', 'VALIDADO') THEN COALESCE(validated_at, closed_at) ELSE NULL END";
 
     db.pragma('foreign_keys = OFF');
     try {
@@ -466,9 +474,8 @@ export function initDatabase(): void {
             assigned_counter_id INTEGER NULL,
             warehouse_manager_id INTEGER NULL,
             created_by_user_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'BORRADOR' CHECK(status IN (
-              'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
-              'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
+            status TEXT NOT NULL DEFAULT 'EJECUCION' CHECK(status IN (
+              'EJECUCION', 'ENTREGADO', 'APROBADO', 'RECHAZADO'
             )),
             weekly_goal_tag TEXT NOT NULL DEFAULT '',
             blind_printed_at TEXT NULL,
@@ -511,8 +518,11 @@ export function initDatabase(): void {
           INSERT INTO counts_migrated (
             id, count_number, document_uid, location_id, scheduled_date,
             assigned_counter_id, warehouse_manager_id, created_by_user_id,
-            status, weekly_goal_tag, blind_printed_at, executed_at,
-            submitted_at, validated_at, approved_at, closed_at,
+            status, weekly_goal_tag, blind_printed_at,
+            executed_at, started_by_user_id, submitted_at, submitted_by_user_id,
+            counter_general_notes, rejected_at, rejected_by_user_id, rejection_reason,
+            approved_at, approved_by_user_id, approval_notes,
+            validated_at, closed_at, closed_by_user_id,
             counter_signature_name, counter_signed_at,
             warehouse_signature_name, warehouse_signed_at, warehouse_confirmed_notes,
             chief_signature_name, chief_signed_at, chief_notes,
@@ -522,33 +532,85 @@ export function initDatabase(): void {
             id, count_number, document_uid, location_id, scheduled_date,
             assigned_counter_id, warehouse_manager_id, created_by_user_id,
             CASE status
-              WHEN 'PROGRAMADO' THEN 'ASIGNADO'
-              WHEN 'EN_PROGRESO' THEN 'EN_EJECUCION'
-              WHEN 'ENVIADO_REVISION' THEN 'PENDIENTE_APROBACION'
+              WHEN 'BORRADOR' THEN 'EJECUCION'
+              WHEN 'ASIGNADO' THEN 'EJECUCION'
+              WHEN 'EN_EJECUCION' THEN 'EJECUCION'
+              WHEN 'PROGRAMADO' THEN 'EJECUCION'
+              WHEN 'EN_PROGRESO' THEN 'EJECUCION'
+              WHEN 'PENDIENTE_APROBACION' THEN 'ENTREGADO'
+              WHEN 'ENVIADO_REVISION' THEN 'ENTREGADO'
+              WHEN 'RECHAZADO' THEN 'RECHAZADO'
               WHEN 'RECONTEO_SOLICITADO' THEN 'RECHAZADO'
-              WHEN 'VALIDADO' THEN 'PENDIENTE_REGULARIZACION'
-              WHEN 'CERRADO' THEN 'CERRADO'
-              ELSE 'BORRADOR'
+              WHEN 'APROBADO' THEN 'APROBADO'
+              WHEN 'PENDIENTE_REGULARIZACION' THEN 'APROBADO'
+              WHEN 'CERRADO' THEN 'APROBADO'
+              WHEN 'VALIDADO' THEN 'APROBADO'
+              ELSE 'EJECUCION'
             END,
             weekly_goal_tag,
-            blind_printed_at,
-            ${hasCol('blind_printed_at') ? 'blind_printed_at' : 'NULL'},
-            submitted_at,
-            validated_at,
-            validated_at,
-            closed_at,
+            ${colExpr('blind_printed_at', 'NULL')},
+            ${hasCol('executed_at') ? 'executed_at' : colExpr('blind_printed_at', 'NULL')},
+            ${colExpr('started_by_user_id', 'NULL')},
+            ${colExpr('submitted_at', 'NULL')},
+            ${colExpr('submitted_by_user_id', 'NULL')},
+            ${colExpr('counter_general_notes', "''")},
+            ${colExpr('rejected_at', 'NULL')},
+            ${colExpr('rejected_by_user_id', 'NULL')},
+            ${colExpr('rejection_reason', "''")},
+            ${approvedAtExpr},
+            ${colExpr('approved_by_user_id', 'NULL')},
+            ${colExpr('approval_notes', "''")},
+            ${colExpr('validated_at', 'NULL')},
+            ${colExpr('closed_at', 'NULL')},
+            ${colExpr('closed_by_user_id', 'NULL')},
             counter_signature_name, counter_signed_at,
             warehouse_signature_name, warehouse_signed_at, warehouse_confirmed_notes,
             chief_signature_name, chief_signed_at, chief_notes,
             has_post_snapshot_movements,
             created_at,
-            COALESCE(closed_at, validated_at, submitted_at, blind_printed_at, created_at)
+            ${hasCol('updated_at') ? "NULLIF(updated_at, '')" : 'NULL'}
           FROM counts;
+
+          UPDATE counts_migrated
+          SET updated_at = COALESCE(updated_at, closed_at, approved_at, validated_at, rejected_at, submitted_at, executed_at, blind_printed_at, created_at);
 
           DROP TABLE counts;
           ALTER TABLE counts_migrated RENAME TO counts;
           CREATE INDEX IF NOT EXISTS idx_counts_loc_status ON counts(location_id, status);
+
+          UPDATE count_submissions
+          SET outcome_status = 'ENTREGADO'
+          WHERE outcome_status IN ('PENDIENTE_APROBACION', 'ENVIADO_REVISION');
         `);
+
+        if (preMigrationCounts.length > 0) {
+          const transitionSummary: Record<string, number> = {};
+          const insertHistMigration = db.prepare(
+            `INSERT INTO count_state_history (count_id, previous_status, new_status, changed_by_user_id, changed_by_username, reason, metadata_json)
+             VALUES (?, ?, ?, NULL, 'sistema', ?, ?)`
+          );
+          for (const row of preMigrationCounts) {
+            const newStatus = mapLegacyStatus(row.status);
+            const key = `${row.status}->${newStatus}`;
+            transitionSummary[key] = (transitionSummary[key] || 0) + 1;
+            if (preHistCount > 0 && row.status !== newStatus) {
+              insertHistMigration.run(
+                row.id,
+                row.status,
+                newStatus,
+                'Migración controlada de circuito de estados a 4 estados (EJECUCION, ENTREGADO, APROBADO, RECHAZADO)',
+                JSON.stringify({ migration: '4-state-lifecycle' })
+              );
+            }
+          }
+          db.prepare(
+            `INSERT INTO audit_events (user_id, username, action, entity_type, entity_id, old_value_json, new_value_json)
+             VALUES (NULL, 'sistema', 'COUNT_LIFECYCLE_4STATE_MIGRATION', 'SYSTEM', 'counts', ?, ?)`
+          ).run(
+            JSON.stringify({ totalCounts: preMigrationCounts.length }),
+            JSON.stringify({ transitions: transitionSummary, backupPath: pre4StateBackupPath })
+          );
+        }
       });
       migrateTx();
 
@@ -721,6 +783,42 @@ export function initDatabase(): void {
       'INSERT INTO risk_config (id, weights_json, thresholds_json) VALUES (1, ?, ?)'
     ).run(JSON.stringify(DEFAULT_RISK_WEIGHTS), JSON.stringify(DEFAULT_RISK_THRESHOLDS));
   }
+
+  // Controlled cleanup of legacy POS tables (preserving preventive backup if DB had POS data)
+  const legacyPosTables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('pos_operations', 'pos_operation_items')")
+    .all() as Array<{ name: string }>;
+
+  if (legacyPosTables.length > 0) {
+    const preCleanupBackupPath = `${DB_PATH}.pre-pos-removal.bak`;
+    if (fs.existsSync(DB_PATH) && !fs.existsSync(preCleanupBackupPath)) {
+      try {
+        fs.copyFileSync(DB_PATH, preCleanupBackupPath);
+      } catch {
+        // non-fatal if filesystem copy fails on empty init
+      }
+    }
+
+    const balCols = new Set(
+      (db.prepare('PRAGMA table_info(inventory_balances)').all() as Array<{ name: string }>).map(
+        (c) => c.name
+      )
+    );
+
+    db.transaction(() => {
+      if (balCols.has('pos_pending_sync')) {
+        db.exec(`
+          UPDATE inventory_balances
+          SET pos_pending_sync = 0,
+              available_stock = MAX(0, erp_physical_stock - committed_stock - review_stock - damaged_stock),
+              updated_at = datetime('now')
+          WHERE pos_pending_sync != 0
+        `);
+      }
+      db.exec('DROP TABLE IF EXISTS pos_operation_items;');
+      db.exec('DROP TABLE IF EXISTS pos_operations;');
+    })();
+  }
 }
 
 export function logAudit(params: {
@@ -779,7 +877,7 @@ export function createNotification(params: {
 export function recomputeAvailableStock(productId: number, locationId: number): void {
   db.prepare(`
     UPDATE inventory_balances
-    SET available_stock = MAX(0, erp_physical_stock - committed_stock - review_stock - damaged_stock - pos_pending_sync),
+    SET available_stock = MAX(0, erp_physical_stock - committed_stock - review_stock - damaged_stock),
         updated_at = datetime('now')
     WHERE product_id = ? AND location_id = ?
   `).run(productId, locationId);

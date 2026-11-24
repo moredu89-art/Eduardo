@@ -20,29 +20,24 @@ import { AuthUser, CountStatus, LocationGroup, UserRole } from '../types/erp';
 
 interface QuickMetrics {
   activeInventoryCounts: number;
-  programados: number;
-  enProgreso: number;
-  reconteos: number;
+  enEjecucion: number;
+  entregados: number;
+  rechazados: number;
+  aprobados: number;
+  aprobadosPendientesReg: number;
+  aprobadosRegularizados: number;
   activeStockUnits: number;
-  pendingValidations: number;
-  awaitingClosure: number;
-  userDailySalesAmount: number;
-  userDailySalesCount: number;
-  userDailySalesUnits: number;
-  teamDailySalesAmount: number;
-  teamDailySalesCount: number;
+  monthlyApprovedCounts?: number;
 }
 
 interface WorkflowSummary {
   totalCreated: number;
-  borradores: number;
-  asignados: number;
   enEjecucion: number;
-  pendientesAprobacion: number;
+  entregados: number;
   rechazados: number;
   aprobados: number;
-  pendientesRegularizacion: number;
-  cerrados: number;
+  aprobadosPendientesReg: number;
+  aprobadosRegularizados: number;
   overdueCounts: number;
 }
 
@@ -74,12 +69,9 @@ interface ActiveCountsByCounter {
   role: string;
   assignedLocationsLabel: string;
   totalActive: number;
-  draftCount: number;
-  assignedCount: number;
   inExecutionCount: number;
-  pendingApprovalCount: number;
+  deliveredCount: number;
   rejectedCount: number;
-  regularizationCount: number;
   overdueCount: number;
   counts: ActiveCounterCountItem[];
 }
@@ -100,19 +92,21 @@ interface MonthlyPendingCountRow {
   is_overdue: number;
 }
 
-interface ClosedCountRow {
+interface ApprovedCountRow {
   id: number;
   count_number: string;
   location_name: string;
   location_group: LocationGroup | string;
   counter_name: string;
   scheduled_date: string;
-  closed_at: string | null;
+  approved_at: string | null;
   chief_signature_name: string;
-  closed_by_name: string;
+  approved_by_name: string;
+  is_current_month?: number;
   items_count: number;
   matches_count: number;
   discrepancies_count: number;
+  pending_reg_items_count: number;
   adjusted_items_count: number;
   no_adjustment_items_count: number;
   net_economic_diff: number;
@@ -126,16 +120,15 @@ interface ExecutiveData {
   currentMonth?: string;
   activeCountsByCounter?: ActiveCountsByCounter[];
   monthlyPendingCounts?: MonthlyPendingCountRow[];
-  closedCounts?: ClosedCountRow[];
+  closedCounts?: ApprovedCountRow[];
   general: {
     totalProducts: number;
     totalLocations: number;
     total_counts: number;
-    programados: number;
-    en_progreso: number;
-    en_revision: number;
-    validados: number;
-    cerrados: number;
+    en_ejecucion: number;
+    entregados: number;
+    rechazados: number;
+    aprobados: number;
     compliancePct: number;
   };
   discrepancies: {
@@ -193,7 +186,7 @@ interface ExecutiveData {
 interface DashboardViewProps {
   currentUser?: AuthUser;
   onNavigate?: (
-    tab: 'management' | 'counts' | 'validation' | 'pos',
+    tab: 'management' | 'counts' | 'validation',
     options?: { managementStatusFilter?: string }
   ) => void;
 }
@@ -246,6 +239,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
   };
 
   const isReadOnlyAudit = currentUser?.role === UserRole.AUDITORIA_DIRECCION;
+  const [closedScope, setClosedScope] = useState<'month' | 'all'>(() =>
+    currentUser?.role === UserRole.AUDITORIA_DIRECCION ? 'month' : 'all'
+  );
 
   const loadDashboard = async () => {
     setLoading(true);
@@ -465,8 +461,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                 </div>
               </div>
               <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-                {data.quickMetrics.programados} borr./asign. · {data.quickMetrics.enProgreso} en ejecución ·{' '}
-                {data.quickMetrics.reconteos} rechazados ·{' '}
+                {data.quickMetrics.enEjecucion} en ejecución · {data.quickMetrics.rechazados} rechazados ·{' '}
                 {data.quickMetrics.activeStockUnits.toLocaleString('es-AR')} u. disp.
               </div>
             </div>
@@ -475,7 +470,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
               <div>
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-medium text-slate-600">
-                    Pendientes de Aprobación
+                    Entregados Pendientes de Revisión
                   </span>
                   {onNavigate && !isReadOnlyAudit && (
                     <button
@@ -483,7 +478,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                       onClick={() => onNavigate('validation')}
                       className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
                     >
-                      Bandeja de aprobación
+                      Bandeja de revisión
                       <ArrowRight className="w-3 h-3" />
                     </button>
                   )}
@@ -492,27 +487,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                       type="button"
                       onClick={() =>
                         onNavigate('management', {
-                          managementStatusFilter: CountStatus.PENDIENTE_APROBACION,
+                          managementStatusFilter: CountStatus.ENTREGADO,
                         })
                       }
                       className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
                     >
-                      Ver pendientes
+                      Ver entregados
                       <ArrowRight className="w-3 h-3" />
                     </button>
                   )}
                 </div>
                 <div
                   className={`text-2xl font-mono font-bold mt-1.5 tabular-nums ${
-                    data.quickMetrics.pendingValidations > 0 ? 'text-amber-700' : 'text-slate-900'
+                    data.quickMetrics.entregados > 0 ? 'text-amber-700' : 'text-slate-900'
                   }`}
                 >
-                  {data.quickMetrics.pendingValidations}
+                  {data.quickMetrics.entregados}
                 </div>
               </div>
               <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-                {data.quickMetrics.pendingValidations} esperando aprobación ·{' '}
-                {data.quickMetrics.awaitingClosure} aprob./pend. regularización
+                {data.quickMetrics.entregados} esperando revisión ·{' '}
+                {data.quickMetrics.aprobadosPendientesReg} aprobado(s) c/ ajuste ERP pend.
               </div>
             </div>
 
@@ -520,40 +515,35 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
               <div>
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-medium text-slate-600">
-                    {isReadOnlyAudit
-                      ? 'Ventas Diarias Consolidadas (POS)'
-                      : `Ventas Diarias (${currentUser ? currentUser.username : 'Usuario'})`}
+                    Conteos Aprobados en el Mes ({data.currentMonth || 'Mes Actual'})
                   </span>
-                  {onNavigate && !isReadOnlyAudit && (
+                  {onNavigate && (
                     <button
                       type="button"
-                      onClick={() => onNavigate('pos')}
+                      onClick={() =>
+                        onNavigate('management', {
+                          managementStatusFilter: CountStatus.APROBADO,
+                        })
+                      }
                       className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
                     >
-                      Ir al POS
+                      Ver aprobados
                       <ArrowRight className="w-3 h-3" />
                     </button>
                   )}
                 </div>
-                <div className="text-2xl font-mono font-bold text-[#8e0d0d] mt-1.5 tabular-nums">
-                  $
-                  {data.quickMetrics.userDailySalesAmount.toLocaleString('es-AR', {
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2,
-                  })}
+                <div className="text-2xl font-mono font-bold text-emerald-700 mt-1.5 tabular-nums">
+                  {data.quickMetrics.monthlyApprovedCounts ??
+                    (data.closedCounts?.filter((c) => Boolean(c.is_current_month)).length || 0)}
                 </div>
               </div>
               <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-                {data.quickMetrics.userDailySalesCount} venta(s) ·{' '}
-                {data.quickMetrics.userDailySalesUnits} u. hoy · Global hoy: $
-                {data.quickMetrics.teamDailySalesAmount.toLocaleString('es-AR', {
-                  maximumFractionDigits: 0,
-                })}
+                {data.general.aprobados} aprobados acumulados · {data.general.compliancePct}% cumplimiento
               </div>
             </div>
           </div>
 
-          {/* 8-State Workflow Tracking Bar */}
+          {/* 4-State Workflow Tracking Bar */}
           {data.workflowSummary && (
             <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -581,20 +571,13 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                 )}
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 {(
                   [
-                    [CountStatus.BORRADOR, data.workflowSummary.borradores],
-                    [CountStatus.ASIGNADO, data.workflowSummary.asignados],
-                    [CountStatus.EN_EJECUCION, data.workflowSummary.enEjecucion],
-                    [CountStatus.PENDIENTE_APROBACION, data.workflowSummary.pendientesAprobacion],
-                    [CountStatus.RECHAZADO, data.workflowSummary.rechazados],
+                    [CountStatus.EJECUCION, data.workflowSummary.enEjecucion],
+                    [CountStatus.ENTREGADO, data.workflowSummary.entregados],
                     [CountStatus.APROBADO, data.workflowSummary.aprobados],
-                    [
-                      CountStatus.PENDIENTE_REGULARIZACION,
-                      data.workflowSummary.pendientesRegularizacion,
-                    ],
-                    [CountStatus.CERRADO, data.workflowSummary.cerrados],
+                    [CountStatus.RECHAZADO, data.workflowSummary.rechazados],
                   ] as Array<[CountStatus, number]>
                 ).map(([st, countVal]) => {
                   const meta = getCountStatusMeta(st);
@@ -726,30 +709,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                         </div>
                       </div>
 
-                      <div className="grid grid-cols-5 gap-1.5 text-[11px] text-center tabular-nums">
+                      <div className="grid grid-cols-3 gap-1.5 text-[11px] text-center tabular-nums">
                         <div className="bg-white border border-slate-200 rounded py-1 px-1">
-                          <div className="text-slate-500">Asign.</div>
-                          <div className="font-mono font-bold text-slate-900">{grp.assignedCount}</div>
-                        </div>
-                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
-                          <div className="text-slate-500">Ejec.</div>
+                          <div className="text-slate-500">En Ejecución</div>
                           <div className="font-mono font-bold text-sky-700">{grp.inExecutionCount}</div>
                         </div>
                         <div className="bg-white border border-slate-200 rounded py-1 px-1">
-                          <div className="text-slate-500">Pend.Apr.</div>
+                          <div className="text-slate-500">Entregados</div>
                           <div className="font-mono font-bold text-amber-700">
-                            {grp.pendingApprovalCount}
+                            {grp.deliveredCount}
                           </div>
                         </div>
                         <div className="bg-white border border-slate-200 rounded py-1 px-1">
-                          <div className="text-slate-500">Rech.</div>
+                          <div className="text-slate-500">Rechazados</div>
                           <div className="font-mono font-bold text-red-700">{grp.rejectedCount}</div>
-                        </div>
-                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
-                          <div className="text-slate-500">Regul.</div>
-                          <div className="font-mono font-bold text-emerald-700">
-                            {grp.regularizationCount}
-                          </div>
                         </div>
                       </div>
 
@@ -812,7 +785,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                       Conteos Planificados Pendientes del Mes ({data.currentMonth || 'Mes Actual'})
                     </h3>
                     <p className="text-[11px] text-slate-500">
-                      Planificaciones del mes corriente que aún no alcanzaron el estado Cerrado / Finalizado.
+                      Planificaciones del mes corriente que aún no alcanzaron el estado Aprobado.
                     </p>
                   </div>
                 </div>
@@ -823,7 +796,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
 
               {data.monthlyPendingCounts.length === 0 ? (
                 <p className="text-xs text-slate-500 py-5 text-center">
-                  No quedan conteos planificados pendientes de cierre para el mes en curso.
+                  No quedan conteos planificados pendientes de aprobación para el mes en curso.
                 </p>
               ) : (
                 <div className="overflow-x-auto max-h-72 border border-slate-200 rounded-lg">
@@ -891,97 +864,134 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
             </div>
           )}
 
-          {/* Executive Oversight: Closed / Finalized Counts */}
-          {data.closedCounts && (
-            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-700" />
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-900">
-                      Conteos Cerrados / Finalizados
-                    </h3>
-                    <p className="text-[11px] text-slate-500">
-                      Auditorías de inventario concluidas con validación del Jefe de Control de Stock, regularización ERP y firma de cierre.
-                    </p>
+          {/* Executive Oversight: Approved Counts & ERP Regularization Tracking */}
+          {data.closedCounts && (() => {
+            const visibleApproved =
+              closedScope === 'month'
+                ? data.closedCounts.filter((cc) => Boolean(cc.is_current_month))
+                : data.closedCounts;
+            return (
+              <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900">
+                        {closedScope === 'month'
+                          ? `Conteos Aprobados en el Mes (${data.currentMonth || 'Mes Actual'})`
+                          : 'Conteos Aprobados y Seguimiento ERP'}
+                      </h3>
+                      <p className="text-[11px] text-slate-500">
+                        Auditorías de inventario aprobadas por Control de Stock y avance del seguimiento de ajustes ERP.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="inline-flex border border-slate-200 rounded-lg overflow-hidden text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setClosedScope('month')}
+                        className={`px-2.5 py-1 font-medium ${
+                          closedScope === 'month'
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-white text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        Mes actual ({data.closedCounts.filter((c) => Boolean(c.is_current_month)).length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setClosedScope('all')}
+                        className={`px-2.5 py-1 font-medium ${
+                          closedScope === 'all'
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-white text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        Histórico ({data.closedCounts.length})
+                      </button>
+                    </div>
+                    {onNavigate && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onNavigate('management', { managementStatusFilter: CountStatus.APROBADO })
+                        }
+                        className="inline-flex items-center gap-1 text-xs font-medium text-[#8e0d0d] hover:underline"
+                      >
+                        Ver aprobados completos
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 </div>
-                {onNavigate && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onNavigate('management', { managementStatusFilter: CountStatus.CERRADO })
-                    }
-                    className="inline-flex items-center gap-1 text-xs font-medium text-[#8e0d0d] hover:underline"
-                  >
-                    Ver historial cerrado completo
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </button>
+
+                {visibleApproved.length === 0 ? (
+                  <p className="text-xs text-slate-500 py-5 text-center">
+                    {closedScope === 'month'
+                      ? 'Aún no hay conteos aprobados durante el mes en curso para los filtros seleccionados.'
+                      : 'Aún no hay conteos aprobados para los filtros seleccionados.'}
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto max-h-80 border border-slate-200 rounded-lg">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-600">
+                          <th className="py-2 px-3">Nro. Conteo</th>
+                          <th className="py-2 px-3">Aprobación</th>
+                          <th className="py-2 px-3">Depósito</th>
+                          <th className="py-2 px-3">Contador</th>
+                          <th className="py-2 px-3">Aprobado por</th>
+                          <th className="py-2 px-3 text-right">Coincid. / Ítems</th>
+                          <th className="py-2 px-3 text-right">Diferencias</th>
+                          <th className="py-2 px-3 text-right">Seguimiento ERP</th>
+                          <th className="py-2 px-3 text-right">Impacto Econ.</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visibleApproved.map((cc) => (
+                          <tr key={cc.id} className="border-b border-slate-100 hover:bg-slate-50">
+                            <td className="py-2 px-3 font-mono font-bold text-slate-900 whitespace-nowrap">
+                              {cc.count_number}
+                            </td>
+                            <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
+                              {cc.approved_at ? String(cc.approved_at).slice(0, 16).replace('T', ' ') : cc.scheduled_date}
+                            </td>
+                            <td className="py-2 px-3 font-medium text-slate-800 whitespace-nowrap">
+                              {cc.location_name}
+                            </td>
+                            <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                              {cc.counter_name}
+                            </td>
+                            <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                              {cc.approved_by_name || cc.chief_signature_name}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              {cc.matches_count}/{cc.items_count}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap">
+                              <span className={cc.discrepancies_count > 0 ? 'text-red-700' : 'text-emerald-700'}>
+                                {cc.discrepancies_count}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono text-[11px] text-slate-600 tabular-nums whitespace-nowrap">
+                              {cc.adjusted_items_count} aj. / {cc.no_adjustment_items_count} s/aj.
+                              {cc.pending_reg_items_count > 0 ? ` / ${cc.pending_reg_items_count} pend.` : ''}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap text-slate-900">
+                              ${Math.abs(Number(cc.abs_economic_diff || 0)).toLocaleString('es-AR', {
+                                maximumFractionDigits: 0,
+                              })}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </div>
-
-              {data.closedCounts.length === 0 ? (
-                <p className="text-xs text-slate-500 py-5 text-center">
-                  Aún no hay conteos cerrados para los filtros seleccionados.
-                </p>
-              ) : (
-                <div className="overflow-x-auto max-h-80 border border-slate-200 rounded-lg">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-600">
-                        <th className="py-2 px-3">Nro. Conteo</th>
-                        <th className="py-2 px-3">Cierre</th>
-                        <th className="py-2 px-3">Depósito</th>
-                        <th className="py-2 px-3">Contador</th>
-                        <th className="py-2 px-3">Validado / Cerrado por</th>
-                        <th className="py-2 px-3 text-right">Coincid. / Ítems</th>
-                        <th className="py-2 px-3 text-right">Diferencias</th>
-                        <th className="py-2 px-3 text-right">Regularización</th>
-                        <th className="py-2 px-3 text-right">Impacto Econ.</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.closedCounts.map((cc) => (
-                        <tr key={cc.id} className="border-b border-slate-100 hover:bg-slate-50">
-                          <td className="py-2 px-3 font-mono font-bold text-slate-900 whitespace-nowrap">
-                            {cc.count_number}
-                          </td>
-                          <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
-                            {cc.closed_at ? String(cc.closed_at).slice(0, 16).replace('T', ' ') : cc.scheduled_date}
-                          </td>
-                          <td className="py-2 px-3 font-medium text-slate-800 whitespace-nowrap">
-                            {cc.location_name}
-                          </td>
-                          <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
-                            {cc.counter_name}
-                          </td>
-                          <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
-                            {cc.chief_signature_name || cc.closed_by_name}
-                          </td>
-                          <td className="py-2 px-3 text-right font-mono tabular-nums whitespace-nowrap">
-                            {cc.matches_count}/{cc.items_count}
-                          </td>
-                          <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap">
-                            <span className={cc.discrepancies_count > 0 ? 'text-red-700' : 'text-emerald-700'}>
-                              {cc.discrepancies_count}
-                            </span>
-                          </td>
-                          <td className="py-2 px-3 text-right font-mono text-[11px] text-slate-600 tabular-nums whitespace-nowrap">
-                            {cc.adjusted_items_count} aj. / {cc.no_adjustment_items_count} s/aj.
-                          </td>
-                          <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap text-slate-900">
-                            ${Math.abs(Number(cc.abs_economic_diff || 0)).toLocaleString('es-AR', {
-                              maximumFractionDigits: 0,
-                            })}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
+            );
+          })()}
         </div>
       )}
 
@@ -1088,8 +1098,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
                 {data.general.compliancePct}%
               </div>
               <div className="text-[11px] text-slate-500 mt-1 tabular-nums">
-                {data.general.cerrados} cerrados · {data.general.en_revision} en revisión ·{' '}
-                {data.general.programados + data.general.en_progreso} pend.
+                {data.general.aprobados} aprobados · {data.general.entregados} entregados ·{' '}
+                {data.general.en_ejecucion + data.general.rechazados} activos
               </div>
             </div>
 

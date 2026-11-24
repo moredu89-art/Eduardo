@@ -269,7 +269,7 @@ export function subscribeCloudCountRecords(
           countNumber: String(data.countNumber || ''),
           locationName: String(data.locationName || ''),
           scheduledDate: String(data.scheduledDate || ''),
-          status: String(data.status || 'BORRADOR'),
+          status: String(data.status || 'EJECUCION'),
           itemsCount: Number(data.itemsCount || 0),
           discrepanciesCount: Number(data.discrepanciesCount || 0),
           counterName: String(data.counterName || ''),
@@ -411,18 +411,15 @@ export async function syncInventoryAndCountsToCloud(params: {
       );
 
       const allowedStatuses = new Set([
-        'BORRADOR',
-        'ASIGNADO',
-        'EN_EJECUCION',
-        'PENDIENTE_APROBACION',
-        'RECHAZADO',
+        'EJECUCION',
+        'ENTREGADO',
         'APROBADO',
-        'PENDIENTE_REGULARIZACION',
-        'CERRADO',
+        'RECHAZADO',
       ]);
-      const status = allowedStatuses.has(String(c.status || ''))
-        ? String(c.status)
-        : 'BORRADOR';
+      const rawStatus = String(c.status || '');
+      const status = allowedStatuses.has(rawStatus)
+        ? rawStatus
+        : 'EJECUCION';
 
       const payloadFields = {
         countNumber,
@@ -448,8 +445,8 @@ export async function syncInventoryAndCountsToCloud(params: {
       };
 
       if (existingRec.exists()) {
-        // Respect terminal state lock if already CERRADO on non-admin client
-        if (String(existingRec.data().status || '') !== 'CERRADO') {
+        // Respect terminal state lock if already APROBADO on non-admin client
+        if (String(existingRec.data().status || '') !== 'APROBADO') {
           batch.update(recRef, payloadFields);
         }
       } else {
