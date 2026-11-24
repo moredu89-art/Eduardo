@@ -39,7 +39,7 @@ export const LocationsView: React.FC<{ currentUser: AuthUser }> = ({ currentUser
   const [form, setForm] = useState({
     code: '',
     name: '',
-    groupType: LocationGroup.SUCURSAL,
+    groupType: LocationGroup.SUCURSAL as LocationGroup,
     address: '',
     managerUserId: '',
   });

@@ -1,9 +1,12 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { LocationGroup, RiskThresholds, RiskWeights } from '../types/erp.ts';
+import { LocationGroup, type RiskThresholds, type RiskWeights } from '../types/erp.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.SICEP_DATA_DIR
+  ? path.resolve(process.env.SICEP_DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
+export const DATA_ROOT_DIR = DATA_DIR;
 export const UPLOADS_DIR = path.resolve(DATA_DIR, 'uploads');
 export const DB_PATH = path.resolve(DATA_DIR, 'erp_inventory.db');
 
@@ -17,6 +20,72 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
+db.pragma('synchronous = NORMAL');
+
+export interface StorageDiagnostics {
+  dataDir: string;
+  dbPath: string;
+  uploadsDir: string;
+  usesCustomDataDirEnv: boolean;
+  mountFilesystemType: string | null;
+  mountPoint: string | null;
+  isEphemeralOverlay: boolean;
+  isVerifiedPersistent: boolean;
+}
+
+export function getStorageDiagnostics(): StorageDiagnostics {
+  const usesCustomDataDirEnv = Boolean(process.env.SICEP_DATA_DIR && process.env.SICEP_DATA_DIR.trim());
+  let mountFilesystemType: string | null = null;
+  let mountPoint: string | null = null;
+
+  try {
+    if (fs.existsSync('/proc/mounts')) {
+      const mounts = fs.readFileSync('/proc/mounts', 'utf8').split('\n');
+      let bestMatchLen = -1;
+      for (const line of mounts) {
+        const parts = line.split(' ');
+        if (parts.length < 3) continue;
+        const mPoint = parts[1];
+        const fsType = parts[2];
+        if (
+          (DATA_DIR === mPoint || DATA_DIR.startsWith(mPoint === '/' ? '/' : `${mPoint}/`)) &&
+          mPoint.length > bestMatchLen
+        ) {
+          bestMatchLen = mPoint.length;
+          mountPoint = mPoint;
+          mountFilesystemType = fsType;
+        }
+      }
+    }
+  } catch {
+    mountFilesystemType = null;
+  }
+
+  const isEphemeralOverlay =
+    mountFilesystemType === 'overlay' ||
+    mountFilesystemType === 'tmpfs' ||
+    mountFilesystemType === 'ramfs';
+
+  // Only treat storage as verified persistent if it is NOT on an ephemeral overlay/tmpfs mount
+  // and (either a dedicated non-root volume mount exists or a custom external SICEP_DATA_DIR mount is used).
+  const isVerifiedPersistent =
+    !isEphemeralOverlay &&
+    mountFilesystemType !== null &&
+    mountPoint !== null &&
+    (mountPoint !== '/' || usesCustomDataDirEnv);
+
+  return {
+    dataDir: DATA_DIR,
+    dbPath: DB_PATH,
+    uploadsDir: UPLOADS_DIR,
+    usesCustomDataDirEnv,
+    mountFilesystemType,
+    mountPoint,
+    isEphemeralOverlay,
+    isVerifiedPersistent,
+  };
+}
 
 export const DEFAULT_RISK_WEIGHTS: RiskWeights = {
   rotation: 15,
@@ -55,10 +124,12 @@ export function initDatabase(): void {
       username TEXT NOT NULL UNIQUE,
       full_name TEXT NOT NULL,
       email TEXT NOT NULL DEFAULT '',
-      role TEXT NOT NULL CHECK(role IN ('JEFE_STOCK', 'CONTADOR', 'RESPONSABLE_DEPOSITO')),
+      role TEXT NOT NULL CHECK(role IN ('JEFE_STOCK', 'CONTADOR', 'RESPONSABLE_DEPOSITO', 'AUDITORIA_DIRECCION')),
       password_hash TEXT NOT NULL,
       assigned_location_ids TEXT NOT NULL DEFAULT '[]',
       assigned_families TEXT NOT NULL DEFAULT '[]',
+      token_version INTEGER NOT NULL DEFAULT 1,
+      password_changed_at TEXT NOT NULL DEFAULT (datetime('now')),
       is_active INTEGER NOT NULL DEFAULT 1,
       last_login_at TEXT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -184,18 +255,29 @@ export function initDatabase(): void {
       document_uid TEXT NOT NULL UNIQUE,
       location_id INTEGER NOT NULL,
       scheduled_date TEXT NOT NULL,
-      assigned_counter_id INTEGER NOT NULL,
+      assigned_counter_id INTEGER NULL,
       warehouse_manager_id INTEGER NULL,
       created_by_user_id INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PROGRAMADO' CHECK(status IN (
-        'PROGRAMADO', 'EN_PROGRESO', 'ENVIADO_REVISION',
-        'RECONTEO_SOLICITADO', 'VALIDADO', 'CERRADO'
+      status TEXT NOT NULL DEFAULT 'BORRADOR' CHECK(status IN (
+        'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
+        'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
       )),
       weekly_goal_tag TEXT NOT NULL DEFAULT '',
       blind_printed_at TEXT NULL,
+      executed_at TEXT NULL,
+      started_by_user_id INTEGER NULL,
       submitted_at TEXT NULL,
+      submitted_by_user_id INTEGER NULL,
+      counter_general_notes TEXT NOT NULL DEFAULT '',
+      rejected_at TEXT NULL,
+      rejected_by_user_id INTEGER NULL,
+      rejection_reason TEXT NOT NULL DEFAULT '',
+      approved_at TEXT NULL,
+      approved_by_user_id INTEGER NULL,
+      approval_notes TEXT NOT NULL DEFAULT '',
       validated_at TEXT NULL,
       closed_at TEXT NULL,
+      closed_by_user_id INTEGER NULL,
       counter_signature_name TEXT NOT NULL DEFAULT '',
       counter_signed_at TEXT NULL,
       warehouse_signature_name TEXT NOT NULL DEFAULT '',
@@ -206,10 +288,16 @@ export function initDatabase(): void {
       chief_notes TEXT NOT NULL DEFAULT '',
       has_post_snapshot_movements INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       FOREIGN KEY (location_id) REFERENCES locations(id),
-      FOREIGN KEY (assigned_counter_id) REFERENCES users(id),
+      FOREIGN KEY (assigned_counter_id) REFERENCES users(id) ON DELETE SET NULL,
       FOREIGN KEY (warehouse_manager_id) REFERENCES users(id) ON DELETE SET NULL,
-      FOREIGN KEY (created_by_user_id) REFERENCES users(id)
+      FOREIGN KEY (created_by_user_id) REFERENCES users(id),
+      FOREIGN KEY (started_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (rejected_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (approved_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (closed_by_user_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS count_items (
@@ -222,6 +310,8 @@ export function initDatabase(): void {
       bulk_qty REAL NULL,
       loose_qty REAL NULL,
       counted_qty REAL NULL,
+      is_not_counted INTEGER NOT NULL DEFAULT 0,
+      not_counted_reason TEXT NOT NULL DEFAULT '',
       recount_bulk_qty REAL NULL,
       recount_loose_qty REAL NULL,
       recount_qty REAL NULL,
@@ -244,6 +334,42 @@ export function initDatabase(): void {
       FOREIGN KEY (count_id) REFERENCES counts(id) ON DELETE CASCADE,
       FOREIGN KEY (product_id) REFERENCES products(id),
       FOREIGN KEY (regularized_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS count_state_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      count_id INTEGER NOT NULL,
+      previous_status TEXT NULL,
+      new_status TEXT NOT NULL,
+      changed_by_user_id INTEGER NULL,
+      changed_by_username TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '',
+      metadata_json TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (count_id) REFERENCES counts(id) ON DELETE CASCADE,
+      FOREIGN KEY (changed_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS count_submissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      count_id INTEGER NOT NULL,
+      version_number INTEGER NOT NULL,
+      submitted_by_user_id INTEGER NULL,
+      submitted_by_username TEXT NOT NULL DEFAULT '',
+      counter_signature_name TEXT NOT NULL DEFAULT '',
+      warehouse_signature_name TEXT NOT NULL DEFAULT '',
+      general_observations TEXT NOT NULL DEFAULT '',
+      items_snapshot_json TEXT NOT NULL,
+      outcome_status TEXT NOT NULL DEFAULT 'PENDIENTE_APROBACION',
+      reviewed_by_user_id INTEGER NULL,
+      reviewed_by_username TEXT NOT NULL DEFAULT '',
+      review_notes TEXT NOT NULL DEFAULT '',
+      reviewed_at TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(count_id, version_number),
+      FOREIGN KEY (count_id) REFERENCES counts(id) ON DELETE CASCADE,
+      FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+      FOREIGN KEY (reviewed_by_user_id) REFERENCES users(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS attachments (
@@ -311,10 +437,171 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_movements_prod_loc ON inventory_movements(product_id, location_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_counts_loc_status ON counts(location_id, status);
     CREATE INDEX IF NOT EXISTS idx_count_items_prod ON count_items(product_id);
+    CREATE INDEX IF NOT EXISTS idx_count_state_hist_cnt ON count_state_history(count_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_count_sub_cnt ON count_submissions(count_id, version_number DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
   `);
 
-  // Idempotent migration for count_items bulk & loose quantity columns
+  // Idempotent migration: upgrade legacy 6-state counts table to 8-state schema & nullable assigned_counter_id
+  const countsSqlRow = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'counts'")
+    .get() as { sql?: string } | undefined;
+
+  if (countsSqlRow?.sql && !countsSqlRow.sql.includes("'PENDIENTE_APROBACION'")) {
+    const oldCols = (db.prepare('PRAGMA table_info(counts)').all() as Array<{ name: string }>).map(
+      (c) => c.name
+    );
+    const hasCol = (name: string) => oldCols.includes(name);
+
+    db.pragma('foreign_keys = OFF');
+    try {
+      const migrateTx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE counts_migrated (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            count_number TEXT NOT NULL UNIQUE,
+            document_uid TEXT NOT NULL UNIQUE,
+            location_id INTEGER NOT NULL,
+            scheduled_date TEXT NOT NULL,
+            assigned_counter_id INTEGER NULL,
+            warehouse_manager_id INTEGER NULL,
+            created_by_user_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'BORRADOR' CHECK(status IN (
+              'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
+              'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
+            )),
+            weekly_goal_tag TEXT NOT NULL DEFAULT '',
+            blind_printed_at TEXT NULL,
+            executed_at TEXT NULL,
+            started_by_user_id INTEGER NULL,
+            submitted_at TEXT NULL,
+            submitted_by_user_id INTEGER NULL,
+            counter_general_notes TEXT NOT NULL DEFAULT '',
+            rejected_at TEXT NULL,
+            rejected_by_user_id INTEGER NULL,
+            rejection_reason TEXT NOT NULL DEFAULT '',
+            approved_at TEXT NULL,
+            approved_by_user_id INTEGER NULL,
+            approval_notes TEXT NOT NULL DEFAULT '',
+            validated_at TEXT NULL,
+            closed_at TEXT NULL,
+            closed_by_user_id INTEGER NULL,
+            counter_signature_name TEXT NOT NULL DEFAULT '',
+            counter_signed_at TEXT NULL,
+            warehouse_signature_name TEXT NOT NULL DEFAULT '',
+            warehouse_signed_at TEXT NULL,
+            warehouse_confirmed_notes TEXT NOT NULL DEFAULT '',
+            chief_signature_name TEXT NOT NULL DEFAULT '',
+            chief_signed_at TEXT NULL,
+            chief_notes TEXT NOT NULL DEFAULT '',
+            has_post_snapshot_movements INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (location_id) REFERENCES locations(id),
+            FOREIGN KEY (assigned_counter_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (warehouse_manager_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (created_by_user_id) REFERENCES users(id),
+            FOREIGN KEY (started_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (rejected_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (approved_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (closed_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+          );
+
+          INSERT INTO counts_migrated (
+            id, count_number, document_uid, location_id, scheduled_date,
+            assigned_counter_id, warehouse_manager_id, created_by_user_id,
+            status, weekly_goal_tag, blind_printed_at, executed_at,
+            submitted_at, validated_at, approved_at, closed_at,
+            counter_signature_name, counter_signed_at,
+            warehouse_signature_name, warehouse_signed_at, warehouse_confirmed_notes,
+            chief_signature_name, chief_signed_at, chief_notes,
+            has_post_snapshot_movements, created_at, updated_at
+          )
+          SELECT
+            id, count_number, document_uid, location_id, scheduled_date,
+            assigned_counter_id, warehouse_manager_id, created_by_user_id,
+            CASE status
+              WHEN 'PROGRAMADO' THEN 'ASIGNADO'
+              WHEN 'EN_PROGRESO' THEN 'EN_EJECUCION'
+              WHEN 'ENVIADO_REVISION' THEN 'PENDIENTE_APROBACION'
+              WHEN 'RECONTEO_SOLICITADO' THEN 'RECHAZADO'
+              WHEN 'VALIDADO' THEN 'PENDIENTE_REGULARIZACION'
+              WHEN 'CERRADO' THEN 'CERRADO'
+              ELSE 'BORRADOR'
+            END,
+            weekly_goal_tag,
+            blind_printed_at,
+            ${hasCol('blind_printed_at') ? 'blind_printed_at' : 'NULL'},
+            submitted_at,
+            validated_at,
+            validated_at,
+            closed_at,
+            counter_signature_name, counter_signed_at,
+            warehouse_signature_name, warehouse_signed_at, warehouse_confirmed_notes,
+            chief_signature_name, chief_signed_at, chief_notes,
+            has_post_snapshot_movements,
+            created_at,
+            COALESCE(closed_at, validated_at, submitted_at, blind_printed_at, created_at)
+          FROM counts;
+
+          DROP TABLE counts;
+          ALTER TABLE counts_migrated RENAME TO counts;
+          CREATE INDEX IF NOT EXISTS idx_counts_loc_status ON counts(location_id, status);
+        `);
+      });
+      migrateTx();
+
+      const fkViolations = db.pragma('foreign_key_check');
+      if (Array.isArray(fkViolations) && fkViolations.length > 0) {
+        throw new Error(`Violación de integridad referencial tras migración: ${JSON.stringify(fkViolations)}`);
+      }
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+  }
+
+  // Idempotent migration for new counts columns
+  const currentCountCols = new Set(
+    (db.prepare('PRAGMA table_info(counts)').all() as Array<{ name: string }>).map((c) => c.name)
+  );
+  const missingCountCols: Array<[string, string]> = [
+    ['executed_at', 'TEXT NULL'],
+    ['started_by_user_id', 'INTEGER NULL'],
+    ['submitted_by_user_id', 'INTEGER NULL'],
+    ['counter_general_notes', "TEXT NOT NULL DEFAULT ''"],
+    ['rejected_at', 'TEXT NULL'],
+    ['rejected_by_user_id', 'INTEGER NULL'],
+    ['rejection_reason', "TEXT NOT NULL DEFAULT ''"],
+    ['approved_at', 'TEXT NULL'],
+    ['approved_by_user_id', 'INTEGER NULL'],
+    ['approval_notes', "TEXT NOT NULL DEFAULT ''"],
+    ['closed_by_user_id', 'INTEGER NULL'],
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
+  ];
+  for (const [colName, colDef] of missingCountCols) {
+    if (!currentCountCols.has(colName)) {
+      db.exec(`ALTER TABLE counts ADD COLUMN ${colName} ${colDef}`);
+    }
+  }
+
+  // Backfill initial count_state_history rows for migrated legacy counts if empty
+  const existingHistCnt = (db.prepare('SELECT COUNT(*) as cnt FROM count_state_history').get() as { cnt: number }).cnt;
+  const existingCountsCnt = (db.prepare('SELECT COUNT(*) as cnt FROM counts').get() as { cnt: number }).cnt;
+  if (existingHistCnt === 0 && existingCountsCnt > 0) {
+    const legacyCounts = db
+      .prepare('SELECT id, status, created_by_user_id, created_at FROM counts')
+      .all() as Array<{ id: number; status: string; created_by_user_id: number; created_at: string }>;
+    const insertHist = db.prepare(
+      `INSERT INTO count_state_history (count_id, previous_status, new_status, changed_by_user_id, changed_by_username, reason, created_at)
+       VALUES (?, NULL, ?, ?, 'sistema', 'Estado inicial migrado desde versión previa', ?)`
+    );
+    for (const lc of legacyCounts) {
+      insertHist.run(lc.id, lc.status, lc.created_by_user_id, lc.created_at);
+    }
+  }
+
+  // Idempotent migration for count_items bulk/loose & not-counted columns
   const countItemCols = db
     .prepare('PRAGMA table_info(count_items)')
     .all() as Array<{ name: string }>;
@@ -322,6 +609,8 @@ export function initDatabase(): void {
   const missingCols: Array<[string, string]> = [
     ['bulk_qty', 'REAL NULL'],
     ['loose_qty', 'REAL NULL'],
+    ['is_not_counted', 'INTEGER NOT NULL DEFAULT 0'],
+    ['not_counted_reason', "TEXT NOT NULL DEFAULT ''"],
     ['recount_bulk_qty', 'REAL NULL'],
     ['recount_loose_qty', 'REAL NULL'],
   ];
@@ -331,12 +620,71 @@ export function initDatabase(): void {
     }
   }
 
-  // Idempotent migration for users.assigned_families
+  // Idempotent migration for users columns (assigned_families, token_version, password_changed_at)
   const userCols = db
     .prepare('PRAGMA table_info(users)')
     .all() as Array<{ name: string }>;
-  if (!userCols.some((c) => c.name === 'assigned_families')) {
+  const existingUserCols = new Set(userCols.map((c) => c.name));
+  if (!existingUserCols.has('assigned_families')) {
     db.exec("ALTER TABLE users ADD COLUMN assigned_families TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!existingUserCols.has('token_version')) {
+    db.exec('ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!existingUserCols.has('password_changed_at')) {
+    db.exec("ALTER TABLE users ADD COLUMN password_changed_at TEXT NOT NULL DEFAULT ''");
+  }
+
+  // Idempotent migration to add AUDITORIA_DIRECCION to users.role CHECK constraint
+  const usersTableMeta = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+    .get() as { sql?: string } | undefined;
+  if (usersTableMeta?.sql && !usersTableMeta.sql.includes('AUDITORIA_DIRECCION')) {
+    db.pragma('foreign_keys = OFF');
+    try {
+      const migrateUsersTx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE users_migrated (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            full_name TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL CHECK(role IN ('JEFE_STOCK', 'CONTADOR', 'RESPONSABLE_DEPOSITO', 'AUDITORIA_DIRECCION')),
+            password_hash TEXT NOT NULL,
+            assigned_location_ids TEXT NOT NULL DEFAULT '[]',
+            assigned_families TEXT NOT NULL DEFAULT '[]',
+            token_version INTEGER NOT NULL DEFAULT 1,
+            password_changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            last_login_at TEXT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+
+          INSERT INTO users_migrated (
+            id, username, full_name, email, role, password_hash,
+            assigned_location_ids, assigned_families, token_version, password_changed_at,
+            is_active, last_login_at, created_at, updated_at
+          )
+          SELECT
+            id, username, full_name, email, role, password_hash,
+            assigned_location_ids, assigned_families, token_version, password_changed_at,
+            is_active, last_login_at, created_at, updated_at
+          FROM users;
+
+          DROP TABLE users;
+          ALTER TABLE users_migrated RENAME TO users;
+        `);
+      });
+      migrateUsersTx();
+
+      const fkViolations = db.pragma('foreign_key_check');
+      if (Array.isArray(fkViolations) && fkViolations.length > 0) {
+        throw new Error(`Violación de integridad referencial tras migración de usuarios: ${JSON.stringify(fkViolations)}`);
+      }
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
   }
 
   // Seed the 11 physical organizational locations (Section 2) if empty

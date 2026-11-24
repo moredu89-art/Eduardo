@@ -1,12 +1,16 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ArrowUpRight,
+  CheckCircle2,
   CheckSquare,
+  ClipboardList,
   Download,
   FileSpreadsheet,
   Printer,
   RotateCcw,
   Search,
   ShieldAlert,
+  ShieldCheck,
   Square,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
@@ -30,8 +34,21 @@ interface BlindCatalogItem {
 interface UserOption {
   id: number;
   fullName: string;
+  username?: string;
   role: UserRole;
-  isActive: boolean;
+}
+
+interface RegisteredCountInfo {
+  countId: number;
+  countNumber: string;
+  documentUid: string;
+  status: string;
+}
+
+interface BlindSheetGeneratorViewProps {
+  currentUser: AuthUser;
+  onNavigateToManagement?: () => void;
+  onNavigateToWorkspace?: (countId: number) => void;
 }
 
 function getTodayIso(): string {
@@ -54,7 +71,11 @@ function createSheetIdentifier(): { countNumber: string; documentUid: string } {
   return { countNumber: `PC-${datePart}-${rand}`, documentUid: uid };
 }
 
-export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ currentUser }) => {
+export const BlindSheetGeneratorView: React.FC<BlindSheetGeneratorViewProps> = ({
+  currentUser,
+  onNavigateToManagement,
+  onNavigateToWorkspace,
+}) => {
   const [locations, setLocations] = useState<LocationRecord[]>([]);
   const [selectedLocationId, setSelectedLocationId] = useState<string>('');
   const [selectedFamily, setSelectedFamily] = useState<string>('');
@@ -70,9 +91,18 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
   const [scheduledDate, setScheduledDate] = useState<string>(getTodayIso);
   const [scheduledTime, setScheduledTime] = useState<string>(getCurrentTime);
   const [counterName, setCounterName] = useState<string>(currentUser.fullName);
+  const [selectedCounterId, setSelectedCounterId] = useState<string>(
+    currentUser.role === UserRole.CONTADOR || currentUser.role === UserRole.JEFE_STOCK
+      ? String(currentUser.id)
+      : ''
+  );
   const [warehouseManagerName, setWarehouseManagerName] = useState<string>('');
   const [sheetMeta, setSheetMeta] = useState(createSheetIdentifier);
   const [counterOptions, setCounterOptions] = useState<UserOption[]>([]);
+
+  const [registerOnEmit, setRegisterOnEmit] = useState<boolean>(true);
+  const [registeredCount, setRegisteredCount] = useState<RegisteredCountInfo | null>(null);
+  const [registering, setRegistering] = useState<boolean>(false);
 
   const [loadingLocations, setLoadingLocations] = useState(true);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
@@ -92,14 +122,6 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
           setSelectedLocationId(String(first.id));
           setWarehouseManagerName(first.managerName || '');
         }
-        if (currentUser.role === UserRole.JEFE_STOCK) {
-          try {
-            const usersRes = await apiFetch<{ users: UserOption[] }>('/api/users');
-            setCounterOptions(usersRes.users.filter((u) => u.isActive));
-          } catch {
-            // Optional suggestion list only
-          }
-        }
       } catch (err: unknown) {
         setError((err as Error).message);
       } finally {
@@ -108,6 +130,36 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
     };
     loadInitial();
   }, [currentUser.role]);
+
+  useEffect(() => {
+    const loadCounters = async () => {
+      try {
+        const qs = selectedLocationId ? `?locationId=${selectedLocationId}` : '';
+        const res = await apiFetch<{ counters: UserOption[] }>(`/api/blind-sheet/counters${qs}`);
+        setCounterOptions(res.counters);
+        if (currentUser.role === UserRole.RESPONSABLE_DEPOSITO) {
+          if (res.counters.length > 0) {
+            setSelectedCounterId((prev) => {
+              const stillValid = res.counters.some((c) => String(c.id) === prev);
+              if (stillValid) return prev;
+              setCounterName(res.counters[0].fullName);
+              return String(res.counters[0].id);
+            });
+          } else {
+            setSelectedCounterId('');
+          }
+        } else if (currentUser.role === UserRole.JEFE_STOCK) {
+          setSelectedCounterId((prev) => {
+            if (!prev || res.counters.some((c) => String(c.id) === prev)) return prev;
+            return String(currentUser.id);
+          });
+        }
+      } catch {
+        // Optional suggestion list only
+      }
+    };
+    loadCounters();
+  }, [selectedLocationId, currentUser.role, currentUser.id]);
 
   useEffect(() => {
     if (!selectedLocationId && locations.length === 0) return;
@@ -146,11 +198,20 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
     loadCatalog();
   }, [selectedLocationId, selectedFamily, selectedRubro, locations.length]);
 
+  const resetSheetRegistrationIfNeeded = () => {
+    if (registeredCount) {
+      setRegisteredCount(null);
+      setSheetMeta(createSheetIdentifier());
+      setStatusMessage(null);
+    }
+  };
+
   const handleLocationChange = (locId: string) => {
     setSelectedLocationId(locId);
     setSelectedFamily('');
     setSelectedRubro('');
     setSelectedSingleProductId('');
+    resetSheetRegistrationIfNeeded();
     const loc = locations.find((l) => String(l.id) === locId);
     setWarehouseManagerName(loc?.managerName || '');
   };
@@ -159,10 +220,12 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
     setSelectedFamily(family);
     setSelectedRubro('');
     setSelectedSingleProductId('');
+    resetSheetRegistrationIfNeeded();
   };
 
   const handleSingleArticleChange = (productIdStr: string) => {
     setSelectedSingleProductId(productIdStr);
+    resetSheetRegistrationIfNeeded();
     if (productIdStr) {
       setSelectedIds([Number(productIdStr)]);
     } else {
@@ -204,6 +267,7 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
 
   const toggleItem = (productId: number) => {
     setSelectedSingleProductId('');
+    resetSheetRegistrationIfNeeded();
     setSelectedIds((prev) =>
       prev.includes(productId) ? prev.filter((id) => id !== productId) : [...prev, productId]
     );
@@ -211,12 +275,23 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
 
   const selectAllVisible = () => {
     setSelectedSingleProductId('');
+    resetSheetRegistrationIfNeeded();
     setSelectedIds(visibleItems.map((it) => it.product_id));
   };
 
   const clearSelection = () => {
     setSelectedSingleProductId('');
+    resetSheetRegistrationIfNeeded();
     setSelectedIds([]);
+  };
+
+  const prepareNewSheet = () => {
+    setRegisteredCount(null);
+    setSheetMeta(createSheetIdentifier());
+    setScheduledDate(getTodayIso());
+    setScheduledTime(getCurrentTime());
+    setStatusMessage(null);
+    setError(null);
   };
 
   const resetFilters = () => {
@@ -224,9 +299,7 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
     setSelectedRubro('');
     setSelectedSingleProductId('');
     setSearchTerm('');
-    setSheetMeta(createSheetIdentifier());
-    setScheduledDate(getTodayIso());
-    setScheduledTime(getCurrentTime());
+    prepareNewSheet();
   };
 
   const logBlindSheetAction = async () => {
@@ -247,16 +320,92 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
     }
   };
 
+  const registerValidatedCount = async (
+    actionType: 'PRINT' | 'PDF'
+  ): Promise<RegisteredCountInfo> => {
+    if (!selectedLocationId) {
+      throw new Error(
+        'Para validar e ingresar el conteo a Gestión de Conteos y Conciliación, seleccione un Depósito / Ubicación específico en el paso 1.'
+      );
+    }
+    const matchedCounter =
+      selectedCounterId && Number(selectedCounterId) > 0
+        ? Number(selectedCounterId)
+        : counterOptions.find(
+            (u) => u.fullName.trim().toLowerCase() === counterName.trim().toLowerCase()
+          )?.id || null;
+
+    const res = await apiFetch<{
+      ok: boolean;
+      alreadyRegistered: boolean;
+      countId: number;
+      countNumber: string;
+      documentUid: string;
+      status: string;
+    }>('/api/blind-sheet/register-count', {
+      method: 'POST',
+      body: JSON.stringify({
+        locationId: Number(selectedLocationId),
+        scheduledDate,
+        countNumber: sheetMeta.countNumber,
+        documentUid: sheetMeta.documentUid,
+        assignedCounterId: matchedCounter,
+        productIds: sheetItems.map((it) => it.product_id),
+        familyLabel,
+        rubroLabel,
+        actionType,
+      }),
+    });
+
+    const info: RegisteredCountInfo = {
+      countId: res.countId,
+      countNumber: res.countNumber,
+      documentUid: res.documentUid,
+      status: res.status,
+    };
+    setSheetMeta({ countNumber: res.countNumber, documentUid: res.documentUid });
+    setRegisteredCount(info);
+    return info;
+  };
+
+  const handleValidateOnlyNow = async () => {
+    if (sheetItems.length === 0) return;
+    setRegistering(true);
+    setError(null);
+    setStatusMessage(null);
+    try {
+      const info = await registerValidatedCount('PRINT');
+      setStatusMessage(
+        `Planilla ${info.countNumber} validada e ingresada en Gestión de Conteos y Conteos y Conciliación (${sheetItems.length} artículo/s).`
+      );
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setRegistering(false);
+    }
+  };
+
   const handleDownloadPdf = async () => {
     if (sheetItems.length === 0) return;
     setExporting(true);
     setStatusMessage(null);
     setError(null);
     try {
-      await logBlindSheetAction();
+      let activeNumber = sheetMeta.countNumber;
+      let activeUid = sheetMeta.documentUid;
+      let regInfo: RegisteredCountInfo | null = null;
+
+      if (registerOnEmit) {
+        regInfo = await registerValidatedCount('PDF');
+        activeNumber = regInfo.countNumber;
+        activeUid = regInfo.documentUid;
+      } else {
+        await logBlindSheetAction();
+      }
+
       await exportBlindCountSheetPdf({
-        countNumber: sheetMeta.countNumber,
-        documentUid: sheetMeta.documentUid,
+        countNumber: activeNumber,
+        documentUid: activeUid,
         scheduledDate,
         scheduledTime,
         locationName: locationLabel,
@@ -272,10 +421,16 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
           rubro: it.rubro,
         })),
       });
-      setStatusMessage(
-        `Planilla PDF ${sheetMeta.countNumber} descargada (${sheetItems.length} artículo/s).`
-      );
-      setSheetMeta(createSheetIdentifier());
+
+      if (regInfo) {
+        setStatusMessage(
+          `PDF ${regInfo.countNumber} descargado y validado en Gestión de Conteos y Conteos y Conciliación (${sheetItems.length} artículo/s).`
+        );
+      } else {
+        setStatusMessage(
+          `Planilla PDF ${activeNumber} descargada (${sheetItems.length} artículo/s).`
+        );
+      }
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
@@ -286,8 +441,25 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
   const handleBrowserPrint = async () => {
     if (sheetItems.length === 0) return;
     setStatusMessage(null);
-    await logBlindSheetAction();
-    window.print();
+    setError(null);
+    setRegistering(true);
+    try {
+      if (registerOnEmit) {
+        const regInfo = await registerValidatedCount('PRINT');
+        setStatusMessage(
+          `Planilla ${regInfo.countNumber} validada e ingresada en Gestión de Conteos y Conteos y Conciliación (${sheetItems.length} artículo/s).`
+        );
+        // Allow React to paint the official count number on the sheet before opening print dialog
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      } else {
+        await logBlindSheetAction();
+      }
+      window.print();
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setRegistering(false);
+    }
   };
 
   return (
@@ -300,7 +472,7 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
               Planilla Imprimible de Conteo Ciego
             </h2>
             <p className="text-sm text-slate-600 mt-0.5">
-              Seleccione depósito, familia, rubro y artículos para imprimir planillas físicas con columnas de bultos y unidades sueltas, sin exponer existencias teóricas.
+              Seleccione depósito, familia, rubro y artículos para imprimir o descargar planillas físicas y validarlas directamente en Gestión de Conteos y Conciliación.
             </p>
           </div>
 
@@ -315,28 +487,95 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
             </button>
             <button
               type="button"
+              onClick={() => setRegisterOnEmit((prev) => !prev)}
+              aria-pressed={registerOnEmit}
+              title="Al activarlo, al imprimir o descargar en PDF la planilla ingresa validada a Gestión de Conteos y Conteos y Conciliación."
+              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold border rounded-lg transition-colors whitespace-nowrap ${
+                registerOnEmit
+                  ? 'bg-emerald-50 border-emerald-600 text-emerald-900 hover:bg-emerald-100'
+                  : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <ShieldCheck
+                className={`w-3.5 h-3.5 ${registerOnEmit ? 'text-emerald-700' : 'text-slate-400'}`}
+              />
+              <span>
+                Validar p/ Gestión y Conciliación: {registerOnEmit ? 'SÍ' : 'NO'}
+              </span>
+            </button>
+            <button
+              type="button"
               onClick={handleBrowserPrint}
-              disabled={sheetItems.length === 0}
+              disabled={sheetItems.length === 0 || registering || exporting}
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
             >
               <Printer className="w-3.5 h-3.5" />
-              Imprimir Planilla
+              {registerOnEmit ? 'Imprimir y Validar' : 'Imprimir Planilla'}
             </button>
             <button
               type="button"
               onClick={handleDownloadPdf}
-              disabled={sheetItems.length === 0 || exporting}
+              disabled={sheetItems.length === 0 || exporting || registering}
               className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] disabled:opacity-50 whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
-              {exporting ? 'Generando PDF...' : 'Descargar Planilla PDF'}
+              {exporting
+                ? 'Generando PDF...'
+                : registerOnEmit
+                  ? 'Descargar PDF y Validar'
+                  : 'Descargar Planilla PDF'}
             </button>
           </div>
         </div>
 
         {statusMessage && (
-          <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-800">
-            {statusMessage}
+          <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-900 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 font-medium">
+              <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+              <span>{statusMessage}</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!registeredCount && (
+                <button
+                  type="button"
+                  onClick={handleValidateOnlyNow}
+                  disabled={registering}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-emerald-700 text-white font-medium rounded-md hover:bg-emerald-800 disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  Validar e Ingresar Ahora
+                </button>
+              )}
+              {registeredCount && onNavigateToManagement && (
+                <button
+                  type="button"
+                  onClick={onNavigateToManagement}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-white border border-emerald-300 text-emerald-900 font-medium rounded-md hover:bg-emerald-100"
+                >
+                  <ClipboardList className="w-3.5 h-3.5" />
+                  Ver en Gestión de Conteos
+                </button>
+              )}
+              {registeredCount && onNavigateToWorkspace && (
+                <button
+                  type="button"
+                  onClick={() => onNavigateToWorkspace(registeredCount.countId)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-[#8e0d0d] text-white font-medium rounded-md hover:bg-[#6e0909]"
+                >
+                  <ArrowUpRight className="w-3.5 h-3.5" />
+                  Ir a Conteos y Conciliación
+                </button>
+              )}
+              {registeredCount && (
+                <button
+                  type="button"
+                  onClick={prepareNewSheet}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-white border border-slate-300 text-slate-700 font-medium rounded-md hover:bg-slate-50"
+                >
+                  Nueva Planilla
+                </button>
+              )}
+            </div>
           </div>
         )}
         {error && (
@@ -471,20 +710,35 @@ export const BlindSheetGeneratorView: React.FC<{ currentUser: AuthUser }> = ({ c
               <label className="block font-semibold text-slate-700 mb-1">
                 Responsable de Conteo
               </label>
-              <input
-                type="text"
-                list="blind-counter-options"
-                value={counterName}
-                onChange={(e) => setCounterName(e.target.value)}
-                placeholder="Nombre y apellido..."
-                className="w-full px-3 py-1.5 border border-slate-300 rounded-lg"
-              />
-              {counterOptions.length > 0 && (
-                <datalist id="blind-counter-options">
+              {currentUser.role !== UserRole.CONTADOR && counterOptions.length > 0 ? (
+                <select
+                  value={selectedCounterId}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setSelectedCounterId(val);
+                    const found = counterOptions.find((u) => String(u.id) === val);
+                    if (found) setCounterName(found.fullName);
+                    resetSheetRegistrationIfNeeded();
+                  }}
+                  className="w-full px-3 py-1.5 border border-slate-300 rounded-lg bg-white text-slate-900"
+                >
+                  {currentUser.role === UserRole.RESPONSABLE_DEPOSITO && (
+                    <option value="">Sin contador asignado</option>
+                  )}
                   {counterOptions.map((u) => (
-                    <option key={u.id} value={u.fullName} />
+                    <option key={u.id} value={String(u.id)}>
+                      {u.fullName}
+                    </option>
                   ))}
-                </datalist>
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  value={counterName}
+                  onChange={(e) => setCounterName(e.target.value)}
+                  placeholder="Nombre y apellido..."
+                  className="w-full px-3 py-1.5 border border-slate-300 rounded-lg"
+                />
               )}
             </div>
 

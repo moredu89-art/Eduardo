@@ -1,5 +1,5 @@
 import * as XLSX from 'xlsx';
-import { CriticalityLevel, ExcelColumnMapping } from '../types/erp.ts';
+import { CriticalityLevel, type ExcelColumnMapping } from '../types/erp.ts';
 import { db, logAudit } from './db.ts';
 
 const COLUMN_SYNONYMS: Record<keyof ExcelColumnMapping, string[]> = {
@@ -24,6 +24,17 @@ function normalizeHeader(h: string): string {
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[_-]+/g, ' ')
     .trim();
+}
+
+function cleanFamilyString(rawFamily: string): string {
+  const trimmed = rawFamily.trim();
+  if (!trimmed) return 'General';
+  if (trimmed.includes('->')) {
+    const parts = trimmed.split('->');
+    const lastPart = (parts[parts.length - 1] ?? '').trim();
+    return lastPart || 'General';
+  }
+  return trimmed;
 }
 
 export function parseExcelBuffer(buffer: Buffer): {
@@ -156,7 +167,7 @@ export function validateExcelRows(
     const rowNumber = idx + 2; // Excel row accounting for header
     const sku = String(row[mapping.sku] ?? '').trim();
     const description = String(row[mapping.description] ?? '').trim();
-    const family = mapping.family ? String(row[mapping.family] ?? '').trim() || 'General' : 'General';
+    const family = mapping.family ? cleanFamilyString(String(row[mapping.family] ?? '')) : 'General';
     const rawLocation = hasLocationMapping ? String(row[mapping.location!] ?? '').trim() : '';
     const rawStock = hasStockMapping ? row[mapping.erpStock!] : '';
     const stockProvided = hasStockMapping && hasCellValue(rawStock);
@@ -450,7 +461,7 @@ export function commitExcelImport(params: {
       seenPairs.add(pairKey);
 
       const alias = params.mapping.alias ? String(row[params.mapping.alias] ?? '').trim() : '';
-      const family = params.mapping.family ? String(row[params.mapping.family] ?? '').trim() : '';
+      const family = params.mapping.family ? cleanFamilyString(String(row[params.mapping.family] ?? '')) : '';
       const brand = params.mapping.brand ? String(row[params.mapping.brand] ?? '').trim() : '';
       const uom = params.mapping.unitOfMeasure ? String(row[params.mapping.unitOfMeasure] ?? '').trim() : '';
       const costPrice = params.mapping.costPrice ? parseNumberField(row[params.mapping.costPrice]) : null;

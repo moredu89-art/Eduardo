@@ -205,25 +205,34 @@ export const CountPlannerView: React.FC = () => {
     }
   };
 
-  const handleCreateManualCount = async () => {
+  const handleCreateManualCount = async (saveAsDraft = false) => {
     setError(null);
-    if (!selectedLocId || !manualCounterId || selectedProductIds.length === 0) {
-      setError('Seleccione ubicación, responsable de conteo y al menos un artículo.');
+    if (!selectedLocId || selectedProductIds.length === 0) {
+      setError('Seleccione ubicación y al menos un artículo.');
+      return;
+    }
+    if (!saveAsDraft && !manualCounterId) {
+      setError('Seleccione un responsable de conteo o guarde como Borrador.');
       return;
     }
     try {
-      const res = await apiFetch<{ countNumber: string }>('/api/counts', {
+      const res = await apiFetch<{ countNumber: string; status: string }>('/api/counts', {
         method: 'POST',
         body: JSON.stringify({
           locationId: Number(selectedLocId),
           scheduledDate,
-          assignedCounterId: Number(manualCounterId),
+          assignedCounterId: saveAsDraft ? null : Number(manualCounterId),
           productIds: selectedProductIds,
           weeklyGoalTag,
+          saveAsDraft,
         }),
       });
       setSelectedProductIds([]);
-      setMessage(`Conteo ciego ${res.countNumber} creado y asignado correctamente.`);
+      setMessage(
+        saveAsDraft
+          ? `Conteo ${res.countNumber} creado en estado BORRADOR (pendiente de asignación).`
+          : `Conteo ciego ${res.countNumber} creado y asignado correctamente.`
+      );
       await loadAll();
     } catch (err: unknown) {
       setError((err as Error).message);
@@ -462,7 +471,7 @@ export const CountPlannerView: React.FC = () => {
               Proponer Distribución Inteligente ({counters.length} contadores)
             </button>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <select
                 value={manualCounterId}
                 onChange={(e) => setManualCounterId(e.target.value)}
@@ -478,11 +487,20 @@ export const CountPlannerView: React.FC = () => {
                 ))}
               </select>
               <button
-                onClick={handleCreateManualCount}
+                type="button"
+                onClick={() => handleCreateManualCount(false)}
                 disabled={selectedProductIds.length === 0 || !manualCounterId}
                 className="px-3 py-1.5 text-xs font-medium border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 disabled:opacity-50"
               >
                 Asignar Selección Manual ({selectedProductIds.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => handleCreateManualCount(true)}
+                disabled={selectedProductIds.length === 0}
+                className="px-3 py-1.5 text-xs font-medium border border-slate-300 text-slate-700 bg-slate-50 rounded-lg hover:bg-slate-100 disabled:opacity-50"
+              >
+                Guardar Borrador ({selectedProductIds.length})
               </button>
             </div>
           </div>

@@ -1,8 +1,8 @@
 import {
   CriticalityLevel,
-  RiskThresholds,
+  type RiskThresholds,
   RiskTier,
-  RiskWeights,
+  type RiskWeights,
   UserRole,
 } from '../types/erp.ts';
 import { db, DEFAULT_RISK_THRESHOLDS, DEFAULT_RISK_WEIGHTS } from './db.ts';
@@ -362,7 +362,7 @@ export function computeRiskMatrix(
         factors.reduce((sum, f) => sum + f.weightedContribution, 0) * 10
       ) / 10;
 
-      let riskTier = RiskTier.BAJO;
+      let riskTier: RiskTier = RiskTier.BAJO;
       let recommendedFrequencyDays = 90;
       if (riskScore >= thresholds.critical) {
         riskTier = RiskTier.CRITICO;
@@ -601,7 +601,7 @@ export function suggestBalancedDistribution(params: {
           FROM counts c
           JOIN count_items ci ON ci.count_id = c.id
           WHERE c.assigned_counter_id = u.id
-            AND c.status IN ('PROGRAMADO', 'EN_PROGRESO', 'RECONTEO_SOLICITADO')
+            AND c.status IN ('ASIGNADO', 'EN_EJECUCION', 'RECHAZADO')
         ), 0) as current_pending_items
       FROM users u
       WHERE u.role = ? AND u.is_active = 1
@@ -643,11 +643,8 @@ export function suggestBalancedDistribution(params: {
     };
   });
 
-  // Prefer counters assigned to this location (or unrestricted)
-  const locationMatched = parsedCounters.filter(
-    (c) => c.locIds.length === 0 || c.locIds.includes(params.locationId)
-  );
-  const activePool = locationMatched.length > 0 ? locationMatched : parsedCounters;
+  // Strictly select counters explicitly authorized for this location
+  const activePool = parsedCounters.filter((c) => c.locIds.includes(params.locationId));
 
   if (activePool.length === 0) {
     return { counters: [], totalSelected: 0 };
@@ -658,7 +655,7 @@ export function suggestBalancedDistribution(params: {
     Math.max(1, params.maxItems)
   );
 
-  // Greedy load-balanced assignment respecting counter's assigned families when configured
+  // Greedy load-balanced assignment strictly respecting counter's assigned families when configured
   const buckets = activePool.map((c) => ({
     counterId: c.id,
     counterName: c.full_name,
@@ -674,10 +671,10 @@ export function suggestBalancedDistribution(params: {
         b.assignedFamilies.length === 0 ||
         b.assignedFamilies.some((f) => f.toLowerCase() === item.family.toLowerCase())
     );
-    const candidateBuckets = familyMatching.length > 0 ? familyMatching : buckets;
-    candidateBuckets.sort((a, b) => a.projectedTotal - b.projectedTotal);
-    candidateBuckets[0].assignedItems.push(item);
-    candidateBuckets[0].projectedTotal += 1;
+    if (familyMatching.length === 0) continue;
+    familyMatching.sort((a, b) => a.projectedTotal - b.projectedTotal);
+    familyMatching[0].assignedItems.push(item);
+    familyMatching[0].projectedTotal += 1;
   }
 
   return {
@@ -688,6 +685,6 @@ export function suggestBalancedDistribution(params: {
       currentPendingItems: b.currentPendingItems,
       assignedItems: b.assignedItems,
     })),
-    totalSelected: rankedItems.length,
+    totalSelected: buckets.reduce((sum, b) => sum + b.assignedItems.length, 0),
   };
 }

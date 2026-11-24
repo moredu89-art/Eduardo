@@ -1,0 +1,364 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Primitive Helpers (Phase 3)
+    // =========================================================================
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isAdmin() {
+      return isEmailVerified() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'mor.edu89@gmail.com'
+      );
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isWorkspaceOwner(workspaceId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/workspaces/$(workspaceId)) &&
+        get(/databases/$(database)/documents/workspaces/$(workspaceId)).data.ownerUid == request.auth.uid;
+    }
+
+    // =========================================================================
+    // Entity Validation Helpers (Pillar 2 - Anti-Update-Gap)
+    // =========================================================================
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'role', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.role in ['JEFE_STOCK', 'CONTADOR', 'RESPONSABLE_DEPOSITO', 'AUDITORIA_DIRECCION'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'email', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAdminMarker(data) {
+      return data.keys().hasAll(['uid', 'grantedBy', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'grantedBy', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.grantedBy is string && data.grantedBy.size() >= 1 && data.grantedBy.size() <= 128 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidWorkspace(data) {
+      return data.keys().hasAll(['id', 'ownerUid', 'name', 'projectCode', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'ownerUid', 'name', 'projectCode', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        isValidId(data.ownerUid) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.projectCode is string && data.projectCode.size() >= 1 && data.projectCode.size() <= 64 &&
+        data.projectCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCatalogSnapshot(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'workspaceId', 'title', 'totalProducts',
+          'totalLocations', 'totalPhysicalStock', 'summaryNotes', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'workspaceId', 'title', 'totalProducts',
+          'totalLocations', 'totalPhysicalStock', 'summaryNotes', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        isValidId(data.workspaceId) &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.totalProducts is int && data.totalProducts >= 0 &&
+        data.totalLocations is int && data.totalLocations >= 0 &&
+        data.totalPhysicalStock is number && data.totalPhysicalStock >= 0 &&
+        data.summaryNotes is string && data.summaryNotes.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCatalogItem(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'workspaceId', 'sku', 'description', 'family', 'brand',
+          'unitOfMeasure', 'totalErpPhysical', 'totalCommitted', 'totalAvailable',
+          'criticalityLevel', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'workspaceId', 'sku', 'description', 'family', 'brand',
+          'unitOfMeasure', 'totalErpPhysical', 'totalCommitted', 'totalAvailable',
+          'criticalityLevel', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        isValidId(data.workspaceId) &&
+        data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 64 &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 300 &&
+        data.family is string && data.family.size() >= 1 && data.family.size() <= 100 &&
+        data.brand is string && data.brand.size() >= 1 && data.brand.size() <= 100 &&
+        data.unitOfMeasure is string && data.unitOfMeasure.size() >= 1 && data.unitOfMeasure.size() <= 24 &&
+        data.totalErpPhysical is number && data.totalErpPhysical >= 0 &&
+        data.totalCommitted is number && data.totalCommitted >= 0 &&
+        data.totalAvailable is number && data.totalAvailable >= 0 &&
+        data.criticalityLevel in ['ALTA', 'MEDIA', 'BAJA'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCountRecord(data) {
+      return data.keys().hasAll([
+          'ownerUid', 'workspaceId', 'countNumber', 'locationName', 'scheduledDate',
+          'status', 'itemsCount', 'discrepanciesCount', 'counterName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'workspaceId', 'countNumber', 'locationName', 'scheduledDate',
+          'status', 'itemsCount', 'discrepanciesCount', 'counterName', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        isValidId(data.workspaceId) &&
+        data.countNumber is string && data.countNumber.size() >= 1 && data.countNumber.size() <= 64 &&
+        data.locationName is string && data.locationName.size() >= 1 && data.locationName.size() <= 120 &&
+        data.scheduledDate is string && data.scheduledDate.size() >= 8 && data.scheduledDate.size() <= 32 &&
+        data.status in [
+          'BORRADOR', 'ASIGNADO', 'EN_EJECUCION', 'PENDIENTE_APROBACION',
+          'RECHAZADO', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO'
+        ] &&
+        data.itemsCount is int && data.itemsCount >= 0 &&
+        data.discrepanciesCount is int && data.discrepanciesCount >= 0 &&
+        data.counterName is string && data.counterName.size() >= 1 && data.counterName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection Rules
+    // =========================================================================
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && (request.auth.uid == adminId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin() &&
+        isValidId(adminId) &&
+        isValidAdminMarker(incoming()) &&
+        incoming().uid == adminId &&
+        incoming().createdAt == request.time;
+      allow update, delete: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isEmailVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().uid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (isAdmin() || incoming().role == 'CONTADOR');
+      allow update: if isEmailVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          isAdmin() ||
+          (
+            isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        );
+      allow delete: if isAdmin();
+
+      match /private/{docId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(docId) && (isOwner(userId) || isAdmin());
+        allow list: if isSignedIn() && (isOwner(userId) || isAdmin());
+        allow create: if isEmailVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          (isOwner(userId) || isAdmin()) &&
+          incoming().uid == userId &&
+          incoming().updatedAt == request.time;
+        allow update: if isEmailVerified() &&
+          isValidId(userId) &&
+          isValidId(docId) &&
+          isValidUserPrivateInfo(incoming()) &&
+          (isOwner(userId) || isAdmin()) &&
+          incoming().uid == existing().uid &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['email', 'updatedAt']);
+        allow delete: if isAdmin();
+      }
+    }
+
+    match /workspaces/{workspaceId} {
+      allow get: if isSignedIn() && isValidId(workspaceId) && (
+        (resource == null && workspaceId == ('ws_' + request.auth.uid)) ||
+        (resource != null && existing().ownerUid == request.auth.uid) ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+      allow create: if isEmailVerified() &&
+        isValidId(workspaceId) &&
+        isValidWorkspace(incoming()) &&
+        incoming().id == workspaceId &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isEmailVerified() &&
+        isValidId(workspaceId) &&
+        isValidWorkspace(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          isAdmin() ||
+          (
+            existing().ownerUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'projectCode', 'updatedAt'])
+          )
+        );
+      allow delete: if isEmailVerified() && isValidId(workspaceId) && (existing().ownerUid == request.auth.uid || isAdmin());
+
+      match /catalogSnapshots/{snapshotId} {
+        allow get: if isSignedIn() && isValidId(workspaceId) && isValidId(snapshotId) &&
+          ((resource != null && existing().ownerUid == request.auth.uid) || isAdmin());
+        allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+        allow create: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(snapshotId) &&
+          isValidCatalogSnapshot(incoming()) &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().workspaceId == workspaceId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isWorkspaceOwner(workspaceId);
+        allow update: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(snapshotId) &&
+          isValidCatalogSnapshot(incoming()) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().workspaceId == existing().workspaceId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            isAdmin() ||
+            (
+              existing().ownerUid == request.auth.uid &&
+              isWorkspaceOwner(workspaceId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'title', 'totalProducts', 'totalLocations', 'totalPhysicalStock', 'summaryNotes', 'updatedAt'
+              ])
+            )
+          );
+        allow delete: if isEmailVerified() && isValidId(workspaceId) && isValidId(snapshotId) &&
+          (existing().ownerUid == request.auth.uid || isAdmin());
+      }
+
+      match /catalogItems/{itemId} {
+        allow get: if isSignedIn() && isValidId(workspaceId) && isValidId(itemId) &&
+          ((resource != null && existing().ownerUid == request.auth.uid) || isAdmin());
+        allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+        allow create: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(itemId) &&
+          isValidCatalogItem(incoming()) &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().workspaceId == workspaceId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isWorkspaceOwner(workspaceId);
+        allow update: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(itemId) &&
+          isValidCatalogItem(incoming()) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().workspaceId == existing().workspaceId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            isAdmin() ||
+            (
+              existing().ownerUid == request.auth.uid &&
+              isWorkspaceOwner(workspaceId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'sku', 'description', 'family', 'brand', 'unitOfMeasure',
+                'totalErpPhysical', 'totalCommitted', 'totalAvailable',
+                'criticalityLevel', 'updatedAt'
+              ])
+            )
+          );
+        allow delete: if isEmailVerified() && isValidId(workspaceId) && isValidId(itemId) &&
+          (existing().ownerUid == request.auth.uid || isAdmin());
+      }
+
+      match /countRecords/{recordId} {
+        allow get: if isSignedIn() && isValidId(workspaceId) && isValidId(recordId) &&
+          ((resource != null && existing().ownerUid == request.auth.uid) || isAdmin());
+        allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isAdmin());
+        allow create: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(recordId) &&
+          isValidCountRecord(incoming()) &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().workspaceId == workspaceId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          isWorkspaceOwner(workspaceId);
+        allow update: if isEmailVerified() &&
+          isValidId(workspaceId) &&
+          isValidId(recordId) &&
+          isValidCountRecord(incoming()) &&
+          incoming().ownerUid == existing().ownerUid &&
+          incoming().workspaceId == existing().workspaceId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            isAdmin() ||
+            (
+              existing().ownerUid == request.auth.uid &&
+              existing().status != 'CERRADO' &&
+              isWorkspaceOwner(workspaceId) &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'countNumber', 'locationName', 'scheduledDate',
+                'status', 'itemsCount', 'discrepanciesCount', 'counterName', 'updatedAt'
+              ])
+            )
+          );
+        allow delete: if isEmailVerified() && isValidId(workspaceId) && isValidId(recordId) &&
+          (existing().ownerUid == request.auth.uid || isAdmin());
+      }
+    }
+  }
+}

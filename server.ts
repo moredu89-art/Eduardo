@@ -1,15 +1,20 @@
+import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import express from 'express';
 import fs from 'fs';
 import multer from 'multer';
+import os from 'os';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import * as XLSX from 'xlsx';
 import { generateExecutiveAiAnalysis } from './src/server/aiService.ts';
 import {
   createNotification,
+  DATA_ROOT_DIR,
   db,
+  DB_PATH,
+  getStorageDiagnostics,
   initDatabase,
   logAudit,
   recomputeAvailableStock,
@@ -29,40 +34,73 @@ import {
   suggestBalancedDistribution,
 } from './src/server/riskEngine.ts';
 import {
-  AuthenticatedRequest,
+  type AuthenticatedRequest,
   createSessionToken,
   hashPassword,
   mapDbUser,
+  parsePositiveInt,
   requireAuth,
   requireRole,
+  revokeUserTokens,
   userCanAccessLocation,
+  validateSecurityConfig,
   verifyPassword,
 } from './src/server/security.ts';
 import {
   AdjustmentOperationType,
+  type AuthUser,
   CountStatus,
-  ExcelColumnMapping,
+  type ExcelColumnMapping,
   LocationGroup,
   PosOperationStatus,
   PosOperationType,
   ReconciliationResult,
-  RiskThresholds,
-  RiskWeights,
+  type RiskThresholds,
+  type RiskWeights,
   UserRole,
 } from './src/types/erp.ts';
 
 dotenv.config();
+validateSecurityConfig();
 initDatabase();
 
-const app = express();
-const PORT = 3000;
+const storageDiag = getStorageDiagnostics();
+if (process.env.NODE_ENV === 'production' && !storageDiag.isVerifiedPersistent) {
+  console.warn(
+    `[SICEP ADVERTENCIA PERSISTENCIA] El directorio de datos (${storageDiag.dataDir}) reside sobre filesystem "${
+      storageDiag.mountFilesystemType || 'desconocido'
+    }" (${storageDiag.mountPoint || 'N/A'}). Configure SICEP_DATA_DIR sobre un volumen persistente para evitar pérdida de datos en redeploys.`
+  );
+}
 
-app.use(express.json({ limit: '15mb' }));
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
+app.use((req, res, next) => {
+  if (req.path === '/api/admin/restore' || req.path === '/api/admin/backup/verify') {
+    express.json({ limit: '60mb' })(req, res, next);
+    return;
+  }
+  express.json({ limit: '15mb' })(req, res, next);
+});
 
 const memoryUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
+
+const ALLOWED_ATTACHMENT_MIMES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'text/csv',
+  'text/plain',
+]);
+const BLOCKED_ATTACHMENT_EXTS = new Set(['.html', '.htm', '.svg', '.js', '.mjs', '.cjs', '.xml', '.xhtml']);
 
 const diskUpload = multer({
   storage: multer.diskStorage({
@@ -73,6 +111,14 @@ const diskUpload = multer({
     },
   }),
   limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (BLOCKED_ATTACHMENT_EXTS.has(ext) || !ALLOWED_ATTACHMENT_MIMES.has(file.mimetype)) {
+      cb(new Error('Tipo de archivo no permitido. Use imágenes (JPG/PNG/WEBP), PDF, Excel o CSV.'));
+      return;
+    }
+    cb(null, true);
+  },
 });
 
 function getClientIp(req: express.Request): string {
@@ -94,6 +140,42 @@ function nextSequenceNumber(prefix: string, table: string, column: string): stri
 // 1. AUTHENTICATION & FIRST-RUN BOOTSTRAP
 // ============================================================================
 
+// In-memory login brute-force rate limiter (10 failed attempts / 15 min per IP + username)
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 10;
+const loginFailures = new Map<string, { count: number; windowStart: number }>();
+
+function getLoginAttemptKey(ip: string, username: string): string {
+  return `${ip || 'unknown'}::${username.trim().toLowerCase()}`;
+}
+
+function isLoginRateLimited(key: string): { limited: boolean; retryAfterSec: number } {
+  const rec = loginFailures.get(key);
+  if (!rec) return { limited: false, retryAfterSec: 0 };
+  const elapsed = Date.now() - rec.windowStart;
+  if (elapsed > LOGIN_RATE_WINDOW_MS) {
+    loginFailures.delete(key);
+    return { limited: false, retryAfterSec: 0 };
+  }
+  if (rec.count >= LOGIN_MAX_FAILURES) {
+    return {
+      limited: true,
+      retryAfterSec: Math.max(1, Math.ceil((LOGIN_RATE_WINDOW_MS - elapsed) / 1000)),
+    };
+  }
+  return { limited: false, retryAfterSec: 0 };
+}
+
+function recordLoginFailure(key: string): void {
+  const now = Date.now();
+  const rec = loginFailures.get(key);
+  if (!rec || now - rec.windowStart > LOGIN_RATE_WINDOW_MS) {
+    loginFailures.set(key, { count: 1, windowStart: now });
+  } else {
+    rec.count += 1;
+  }
+}
+
 app.get('/api/auth/status', (_req, res) => {
   const adminCount = (
     db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'JEFE_STOCK'").get() as {
@@ -104,19 +186,6 @@ app.get('/api/auth/status', (_req, res) => {
 });
 
 app.post('/api/auth/bootstrap', (req, res) => {
-  const adminCount = (
-    db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'JEFE_STOCK'").get() as {
-      cnt: number;
-    }
-  ).cnt;
-
-  if (adminCount > 0) {
-    res.status(409).json({
-      error: 'El sistema ya fue inicializado. Inicie sesión con sus credenciales.',
-    });
-    return;
-  }
-
   const { username, fullName, email, password } = req.body as {
     username?: string;
     fullName?: string;
@@ -134,31 +203,53 @@ app.post('/api/auth/bootstrap', (req, res) => {
   const cleanUser = username.trim().toLowerCase();
   const pwHash = hashPassword(password);
 
-  const info = db
-    .prepare(
-      `INSERT INTO users (username, full_name, email, role, password_hash, assigned_location_ids, assigned_families, is_active, last_login_at)
-       VALUES (?, ?, ?, 'JEFE_STOCK', ?, '[]', '[]', 1, datetime('now'))`
-    )
-    .run(cleanUser, fullName.trim(), (email || '').trim(), pwHash);
+  const bootstrapTx = db.transaction(() => {
+    const adminCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'JEFE_STOCK'").get() as {
+        cnt: number;
+      }
+    ).cnt;
 
-  const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid) as Record<
-    string,
-    unknown
-  >;
-  const authUser = mapDbUser(userRow);
-  const token = createSessionToken(authUser);
+    if (adminCount > 0) {
+      return null;
+    }
 
-  logAudit({
-    userId: authUser.id,
-    username: authUser.username,
-    action: 'SYSTEM_BOOTSTRAP_ADMIN',
-    entityType: 'USER',
-    entityId: authUser.id,
-    newValue: { username: authUser.username, role: authUser.role },
-    ipAddress: getClientIp(req),
+    const info = db
+      .prepare(
+        `INSERT INTO users (username, full_name, email, role, password_hash, assigned_location_ids, assigned_families, token_version, password_changed_at, is_active, last_login_at)
+         VALUES (?, ?, ?, 'JEFE_STOCK', ?, '[]', '[]', 1, datetime('now'), 1, datetime('now'))`
+      )
+      .run(cleanUser, fullName.trim(), (email || '').trim(), pwHash);
+
+    const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid) as Record<
+      string,
+      unknown
+    >;
+    const authUser = mapDbUser(userRow);
+    const token = createSessionToken(authUser, Number(userRow.token_version ?? 1));
+
+    logAudit({
+      userId: authUser.id,
+      username: authUser.username,
+      action: 'SYSTEM_BOOTSTRAP_ADMIN',
+      entityType: 'USER',
+      entityId: authUser.id,
+      newValue: { username: authUser.username, role: authUser.role },
+      ipAddress: getClientIp(req),
+    });
+
+    return { token, user: authUser };
   });
 
-  res.status(201).json({ token, user: authUser });
+  const created = bootstrapTx.immediate();
+  if (!created) {
+    res.status(409).json({
+      error: 'El sistema ya fue inicializado. Inicie sesión con sus credenciales.',
+    });
+    return;
+  }
+
+  res.status(201).json(created);
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -168,18 +259,30 @@ app.post('/api/auth/login', (req, res) => {
     return;
   }
 
+  const clientIp = getClientIp(req);
   const cleanUser = username.trim().toLowerCase();
+  const rateKey = getLoginAttemptKey(clientIp, cleanUser);
+  const rateCheck = isLoginRateLimited(rateKey);
+  if (rateCheck.limited) {
+    res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
+    res.status(429).json({
+      error: `Demasiados intentos fallidos. Intente nuevamente en ${Math.ceil(rateCheck.retryAfterSec / 60)} minuto(s).`,
+    });
+    return;
+  }
+
   const row = db
     .prepare('SELECT * FROM users WHERE LOWER(username) = ?')
     .get(cleanUser) as Record<string, unknown> | undefined;
 
   if (!row || !verifyPassword(password, String(row.password_hash))) {
+    recordLoginFailure(rateKey);
     logAudit({
       username: cleanUser,
       action: 'LOGIN_FAILED',
       entityType: 'AUTH',
       newValue: { username: cleanUser },
-      ipAddress: getClientIp(req),
+      ipAddress: clientIp,
     });
     res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
     return;
@@ -190,13 +293,14 @@ app.post('/api/auth/login', (req, res) => {
     return;
   }
 
+  loginFailures.delete(rateKey);
   db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(row.id);
   const updated = db.prepare('SELECT * FROM users WHERE id = ?').get(row.id) as Record<
     string,
     unknown
   >;
   const user = mapDbUser(updated);
-  const token = createSessionToken(user);
+  const token = createSessionToken(user, Number(updated.token_version ?? 1));
 
   logAudit({
     userId: user.id,
@@ -204,10 +308,23 @@ app.post('/api/auth/login', (req, res) => {
     action: 'USER_LOGIN',
     entityType: 'AUTH',
     entityId: user.id,
-    ipAddress: getClientIp(req),
+    ipAddress: clientIp,
   });
 
   res.json({ token, user });
+});
+
+app.post('/api/auth/logout', requireAuth, (req: AuthenticatedRequest, res) => {
+  revokeUserTokens(req.user!.id);
+  logAudit({
+    userId: req.user!.id,
+    username: req.user!.username,
+    action: 'USER_LOGOUT',
+    entityType: 'AUTH',
+    entityId: req.user!.id,
+    ipAddress: getClientIp(req),
+  });
+  res.json({ ok: true });
 });
 
 app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -257,15 +374,24 @@ app.post('/api/users', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Auth
     return;
   }
 
-  const locs = Array.isArray(assignedLocationIds) ? assignedLocationIds.map(Number) : [];
-  const fams = Array.isArray(assignedFamilies)
-    ? Array.from(new Set(assignedFamilies.map((f) => String(f).trim()).filter(Boolean)))
-    : [];
+  const validLocationIds = new Set(
+    (db.prepare('SELECT id FROM locations').all() as Array<{ id: number }>).map((l) => l.id)
+  );
+  const locs =
+    role === UserRole.AUDITORIA_DIRECCION || role === UserRole.JEFE_STOCK
+      ? []
+      : Array.isArray(assignedLocationIds)
+        ? Array.from(new Set(assignedLocationIds.map(Number).filter((id) => validLocationIds.has(id))))
+        : [];
+  const fams =
+    role === UserRole.CONTADOR && Array.isArray(assignedFamilies)
+      ? Array.from(new Set(assignedFamilies.map((f) => String(f).trim()).filter(Boolean)))
+      : [];
   const pwHash = hashPassword(password);
   const info = db
     .prepare(
-      `INSERT INTO users (username, full_name, email, role, password_hash, assigned_location_ids, assigned_families, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO users (username, full_name, email, role, password_hash, assigned_location_ids, assigned_families, token_version, password_changed_at, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), 1)`
     )
     .run(
       cleanUser,
@@ -303,7 +429,11 @@ app.post('/api/users', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Auth
 });
 
 app.patch('/api/users/:id', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: AuthenticatedRequest, res) => {
-  const targetId = Number(req.params.id);
+  const targetId = parsePositiveInt(req.params.id);
+  if (!targetId) {
+    res.status(400).json({ error: 'Identificador de usuario inválido.' });
+    return;
+  }
   const oldRow = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId) as
     | Record<string, unknown>
     | undefined;
@@ -325,20 +455,50 @@ app.patch('/api/users/:id', requireAuth, requireRole(UserRole.JEFE_STOCK), (req:
     res.status(400).json({ error: 'No puede deshabilitar su propia cuenta de administrador activa.' });
     return;
   }
+  if (targetId === req.user!.id && role && role !== UserRole.JEFE_STOCK) {
+    res.status(400).json({ error: 'No puede degradar el rol de su propia cuenta administradora activa.' });
+    return;
+  }
 
+  const validLocationIds = new Set(
+    (db.prepare('SELECT id FROM locations').all() as Array<{ id: number }>).map((l) => l.id)
+  );
   const nextRole = role && Object.values(UserRole).includes(role) ? role : (oldRow.role as UserRole);
-  const nextLocs = Array.isArray(assignedLocationIds)
-    ? JSON.stringify(assignedLocationIds.map(Number))
-    : String(oldRow.assigned_location_ids || '[]');
-  const nextFams = Array.isArray(assignedFamilies)
-    ? JSON.stringify(
-        Array.from(new Set(assignedFamilies.map((f) => String(f).trim()).filter(Boolean)))
-      )
-    : String(oldRow.assigned_families || '[]');
+  const nextLocs =
+    nextRole === UserRole.AUDITORIA_DIRECCION || nextRole === UserRole.JEFE_STOCK
+      ? '[]'
+      : Array.isArray(assignedLocationIds)
+        ? JSON.stringify(
+            Array.from(new Set(assignedLocationIds.map(Number).filter((id) => validLocationIds.has(id))))
+          )
+        : String(oldRow.assigned_location_ids || '[]');
+  const nextFams =
+    nextRole !== UserRole.CONTADOR
+      ? '[]'
+      : Array.isArray(assignedFamilies)
+        ? JSON.stringify(
+            Array.from(new Set(assignedFamilies.map((f) => String(f).trim()).filter(Boolean)))
+          )
+        : String(oldRow.assigned_families || '[]');
   const nextActive = typeof isActive === 'boolean' ? (isActive ? 1 : 0) : Number(oldRow.is_active);
 
+  const permissionsChanged =
+    nextRole !== oldRow.role ||
+    nextLocs !== String(oldRow.assigned_location_ids || '[]') ||
+    nextFams !== String(oldRow.assigned_families || '[]') ||
+    nextActive !== Number(oldRow.is_active);
+
   db.prepare(
-    `UPDATE users SET full_name = ?, email = ?, role = ?, assigned_location_ids = ?, assigned_families = ?, is_active = ?, updated_at = datetime('now') WHERE id = ?`
+    `UPDATE users SET
+      full_name = ?,
+      email = ?,
+      role = ?,
+      assigned_location_ids = ?,
+      assigned_families = ?,
+      is_active = ?,
+      token_version = CASE WHEN ? THEN COALESCE(token_version, 1) + 1 ELSE COALESCE(token_version, 1) END,
+      updated_at = datetime('now')
+     WHERE id = ?`
   ).run(
     fullName ? fullName.trim() : String(oldRow.full_name),
     email !== undefined ? email.trim() : String(oldRow.email || ''),
@@ -346,6 +506,7 @@ app.patch('/api/users/:id', requireAuth, requireRole(UserRole.JEFE_STOCK), (req:
     nextLocs,
     nextFams,
     nextActive,
+    permissionsChanged ? 1 : 0,
     targetId
   );
 
@@ -372,7 +533,11 @@ app.post(
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
   (req: AuthenticatedRequest, res) => {
-    const targetId = Number(req.params.id);
+    const targetId = parsePositiveInt(req.params.id);
+    if (!targetId) {
+      res.status(400).json({ error: 'Identificador de usuario inválido.' });
+      return;
+    }
     const { newPassword } = req.body as { newPassword?: string };
     if (!newPassword || newPassword.length < 6) {
       res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres.' });
@@ -387,10 +552,14 @@ app.post(
       return;
     }
 
-    db.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").run(
-      hashPassword(newPassword),
-      targetId
-    );
+    db.prepare(
+      `UPDATE users SET
+        password_hash = ?,
+        token_version = COALESCE(token_version, 1) + 1,
+        password_changed_at = datetime('now'),
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(hashPassword(newPassword), targetId);
 
     logAudit({
       userId: req.user!.id,
@@ -398,7 +567,7 @@ app.post(
       action: 'USER_PASSWORD_RESET',
       entityType: 'USER',
       entityId: targetId,
-      newValue: { username: oldRow.username, resetBy: req.user!.username },
+      newValue: { username: oldRow.username, resetBy: req.user!.username, sessionsRevoked: true },
       ipAddress: getClientIp(req),
     });
 
@@ -418,7 +587,7 @@ app.get('/api/locations', requireAuth, (req: AuthenticatedRequest, res) => {
         (SELECT COUNT(*) FROM inventory_balances ib WHERE ib.location_id = l.id) as skus_count,
         (SELECT COALESCE(SUM(ib.erp_physical_stock), 0) FROM inventory_balances ib WHERE ib.location_id = l.id) as total_erp_stock,
         (SELECT COALESCE(SUM(ib.available_stock), 0) FROM inventory_balances ib WHERE ib.location_id = l.id) as total_available_stock,
-        (SELECT COUNT(*) FROM counts c WHERE c.location_id = l.id AND c.status IN ('PROGRAMADO','EN_PROGRESO','ENVIADO_REVISION','RECONTEO_SOLICITADO','VALIDADO')) as open_counts,
+        (SELECT COUNT(*) FROM counts c WHERE c.location_id = l.id AND c.status IN ('BORRADOR','ASIGNADO','EN_EJECUCION','PENDIENTE_APROBACION','RECHAZADO','APROBADO','PENDIENTE_REGULARIZACION')) as open_counts,
         (SELECT COUNT(*) FROM count_items ci JOIN counts c ON c.id = ci.count_id WHERE c.location_id = l.id AND ci.reconciliation_result IN ('FALTANTE','SOBRANTE')) as total_discrepancies,
         (SELECT COUNT(*) FROM count_items ci JOIN counts c ON c.id = ci.count_id WHERE c.location_id = l.id AND ci.reconciliation_result = 'COINCIDENCIA') as total_matches
       FROM locations l
@@ -429,7 +598,7 @@ app.get('/api/locations', requireAuth, (req: AuthenticatedRequest, res) => {
     .all() as Array<Record<string, unknown>>;
 
   const filtered =
-    req.user!.role === UserRole.JEFE_STOCK
+    req.user!.role === UserRole.JEFE_STOCK || req.user!.role === UserRole.AUDITORIA_DIRECCION
       ? rows
       : rows.filter((r) => userCanAccessLocation(req.user!, Number(r.id)));
 
@@ -662,7 +831,7 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  if (req.user!.role !== UserRole.JEFE_STOCK) {
+  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
     if (req.user!.assignedLocationIds.length === 0) {
       res.json({ items: [], consolidated: [], batchesCount: 0 });
       return;
@@ -725,6 +894,18 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
 
   const consolidatedConds: string[] = [];
   const consolidatedParams: unknown[] = [];
+  let consolidatedBalanceJoin = 'LEFT JOIN inventory_balances ib ON ib.product_id = p.id';
+
+  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
+    const locPlaceholders = req.user!.assignedLocationIds.map(() => '?').join(',');
+    consolidatedBalanceJoin = `LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.location_id IN (${locPlaceholders})`;
+    consolidatedParams.push(...req.user!.assignedLocationIds);
+  }
+  if (locationId) {
+    consolidatedBalanceJoin += ' AND ib.location_id = ?';
+    consolidatedParams.push(locationId);
+  }
+
   if (family) {
     consolidatedConds.push('p.family = ?');
     consolidatedParams.push(family);
@@ -759,7 +940,7 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
         COALESCE(SUM(ib.pos_pending_sync), 0) as total_pos_pending,
         COALESCE(SUM(ib.available_stock), 0) as total_available
       FROM products p
-      LEFT JOIN inventory_balances ib ON ib.product_id = p.id
+      ${consolidatedBalanceJoin}
       ${consolidatedWhereSql}
       GROUP BY p.id
       ORDER BY p.description ASC
@@ -782,17 +963,74 @@ app.get('/api/inventory', requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ items, consolidated, batchesCount, families });
 });
 
-app.get('/api/inventory/batches', requireAuth, requireRole(UserRole.JEFE_STOCK), (_req, res) => {
+app.get(
+  '/api/inventory/batches',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION),
+  (_req, res) => {
   const batches = db
     .prepare(
-      `SELECT ib.*, u.full_name as uploaded_by_name
+      `SELECT ib.*, COALESCE(u.full_name, 'Usuario eliminado') as uploaded_by_name
        FROM import_batches ib
-       JOIN users u ON u.id = ib.uploaded_by_user_id
+       LEFT JOIN users u ON u.id = ib.uploaded_by_user_id
        ORDER BY ib.created_at DESC LIMIT 50`
     )
     .all();
   res.json({ batches });
 });
+
+app.delete(
+  '/api/inventory/batches/:id',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  (req: AuthenticatedRequest, res) => {
+    const batchId = parsePositiveInt(req.params.id);
+    if (!batchId) {
+      res.status(400).json({ error: 'Identificador de lote inválido.' });
+      return;
+    }
+
+    try {
+      const batch = db
+        .prepare('SELECT * FROM import_batches WHERE id = ?')
+        .get(batchId) as Record<string, unknown> | undefined;
+
+      if (!batch) {
+        res.status(404).json({ error: 'Lote de importación no encontrado.' });
+        return;
+      }
+
+      const deleteTx = db.transaction(() => {
+        // Solo elimina la cabecera del lote; inventory_balances.last_import_batch_id queda en NULL (ON DELETE SET NULL)
+        db.prepare('DELETE FROM import_batches WHERE id = ?').run(batchId);
+
+        logAudit({
+          userId: req.user!.id,
+          username: req.user!.username,
+          action: 'ERP_IMPORT_BATCH_DELETED',
+          entityType: 'IMPORT_BATCH',
+          entityId: batchId,
+          oldValue: {
+            filename: batch.filename,
+            cutoffTimestamp: batch.cutoff_timestamp,
+            totalRows: batch.total_rows,
+            insertedProducts: batch.inserted_products,
+            updatedBalances: batch.updated_balances,
+            createdAt: batch.created_at,
+          },
+          ipAddress: getClientIp(req),
+        });
+      });
+
+      deleteTx();
+      res.json({ ok: true });
+    } catch (err: unknown) {
+      res.status(500).json({
+        error: (err as Error).message || 'Error interno al eliminar el lote de importación.',
+      });
+    }
+  }
+);
 
 app.post(
   '/api/inventory/import/preview',
@@ -926,7 +1164,11 @@ app.patch(
   }
 );
 
-app.get('/api/inventory/export', requireAuth, requireRole(UserRole.JEFE_STOCK), (_req, res) => {
+app.get(
+  '/api/inventory/export',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION),
+  (_req, res) => {
   const rows = db
     .prepare(
       `SELECT p.sku as "Código", p.description as "Descripción", p.alias as "Alias",
@@ -1021,16 +1263,32 @@ app.post('/api/risk/distribute', requireAuth, requireRole(UserRole.JEFE_STOCK), 
   res.json(plan);
 });
 
-app.get('/api/goals', requireAuth, (_req, res) => {
+app.get('/api/goals', requireAuth, (req: AuthenticatedRequest, res) => {
+  const conds: string[] = [];
+  const params: unknown[] = [];
+
+  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
+    if (req.user!.assignedLocationIds.length > 0) {
+      const ph = req.user!.assignedLocationIds.map(() => '?').join(',');
+      conds.push(`(g.assigned_counter_id = ? OR g.location_id IN (${ph}))`);
+      params.push(req.user!.id, ...req.user!.assignedLocationIds);
+    } else {
+      conds.push('g.assigned_counter_id = ?');
+      params.push(req.user!.id);
+    }
+  }
+
+  const whereSql = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const goals = db
     .prepare(
       `SELECT g.*, l.name as location_name, u.full_name as counter_name
        FROM count_goals g
        LEFT JOIN locations l ON l.id = g.location_id
        LEFT JOIN users u ON u.id = g.assigned_counter_id
+       ${whereSql}
        ORDER BY g.target_date DESC, g.id DESC LIMIT 40`
     )
-    .all();
+    .all(...params);
   res.json({ goals });
 });
 
@@ -1075,7 +1333,7 @@ app.get('/api/blind-sheet/catalog', requireAuth, (req: AuthenticatedRequest, res
   const rubro = String(req.query.rubro || '').trim();
   const search = String(req.query.search || '').trim();
 
-  if (locationId && req.user!.role !== UserRole.JEFE_STOCK) {
+  if (locationId && req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
     const hasCountInLoc = db
       .prepare('SELECT 1 FROM counts WHERE location_id = ? AND assigned_counter_id = ? LIMIT 1')
       .get(locationId, req.user!.id);
@@ -1088,7 +1346,12 @@ app.get('/api/blind-sheet/catalog', requireAuth, (req: AuthenticatedRequest, res
   const conds: string[] = [];
   const params: unknown[] = [];
 
-  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.assignedLocationIds.length === 0 && !locationId) {
+  if (
+    req.user!.role !== UserRole.JEFE_STOCK &&
+    req.user!.role !== UserRole.AUDITORIA_DIRECCION &&
+    req.user!.assignedLocationIds.length === 0 &&
+    !locationId
+  ) {
     res.json({ items: [], families: [], rubros: [] });
     return;
   }
@@ -1169,7 +1432,11 @@ app.get('/api/blind-sheet/catalog', requireAuth, (req: AuthenticatedRequest, res
   res.json({ items, families, rubros });
 });
 
-app.post('/api/blind-sheet/log-print', requireAuth, (req: AuthenticatedRequest, res) => {
+app.post(
+  '/api/blind-sheet/log-print',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
   const { documentUid, locationId, family, rubro, itemsCount, countNumber } = req.body as {
     documentUid?: string;
     locationId?: number;
@@ -1179,13 +1446,39 @@ app.post('/api/blind-sheet/log-print', requireAuth, (req: AuthenticatedRequest, 
     countNumber?: string;
   };
 
+  let verifiedLocationId: number | null = null;
+  if (locationId !== undefined && locationId !== null) {
+    const locIdNum = parsePositiveInt(locationId);
+    if (!locIdNum) {
+      res.status(400).json({ error: 'Ubicación inválida.' });
+      return;
+    }
+    if (req.user!.role !== UserRole.JEFE_STOCK) {
+      const hasCountInLoc =
+        req.user!.role === UserRole.CONTADOR &&
+        Boolean(
+          db
+            .prepare('SELECT 1 FROM counts WHERE location_id = ? AND assigned_counter_id = ? LIMIT 1')
+            .get(locIdNum, req.user!.id)
+        );
+      if (!userCanAccessLocation(req.user!, locIdNum) && !hasCountInLoc) {
+        res.status(403).json({ error: 'No tiene permisos sobre la ubicación seleccionada.' });
+        return;
+      }
+    }
+    verifiedLocationId = locIdNum;
+  } else if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.assignedLocationIds.length === 0) {
+    res.status(403).json({ error: 'No tiene depósitos asignados para emitir planillas ciegas.' });
+    return;
+  }
+
   logAudit({
     userId: req.user!.id,
     username: req.user!.username,
     action: 'BLIND_SHEET_GENERATED',
     entityType: 'BLIND_SHEET',
     entityId: documentUid || '',
-    locationId: locationId || null,
+    locationId: verifiedLocationId,
     newValue: { documentUid, countNumber, family, rubro, itemsCount },
     ipAddress: getClientIp(req),
   });
@@ -1193,9 +1486,488 @@ app.post('/api/blind-sheet/log-print', requireAuth, (req: AuthenticatedRequest, 
   res.json({ ok: true });
 });
 
+app.get('/api/blind-sheet/counters', requireAuth, (req: AuthenticatedRequest, res) => {
+  const locationId = req.query.locationId ? parsePositiveInt(req.query.locationId) : null;
+
+  if (req.user!.role === UserRole.CONTADOR) {
+    res.json({
+      counters: [
+        {
+          id: req.user!.id,
+          fullName: req.user!.fullName,
+          username: req.user!.username,
+          role: req.user!.role,
+          assignedLocationIds: req.user!.assignedLocationIds,
+          assignedFamilies: req.user!.assignedFamilies,
+        },
+      ],
+    });
+    return;
+  }
+
+  if (
+    locationId &&
+    req.user!.role === UserRole.RESPONSABLE_DEPOSITO &&
+    !userCanAccessLocation(req.user!, locationId)
+  ) {
+    res.status(403).json({ error: 'No tiene permisos sobre la ubicación seleccionada.' });
+    return;
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT * FROM users
+       WHERE is_active = 1 AND role IN ('CONTADOR', 'JEFE_STOCK')
+       ORDER BY CASE WHEN role = 'CONTADOR' THEN 0 ELSE 1 END, full_name ASC`
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const mapped = rows.map(mapDbUser).filter((u) => {
+    if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO && u.role !== UserRole.CONTADOR) {
+      return false;
+    }
+    if (locationId && u.role === UserRole.CONTADOR) {
+      return userCanAccessLocation(u, locationId);
+    }
+    return true;
+  });
+
+  res.json({
+    counters: mapped.map((u) => ({
+      id: u.id,
+      fullName: u.fullName,
+      username: u.username,
+      role: u.role,
+      assignedLocationIds: u.assignedLocationIds,
+      assignedFamilies: u.assignedFamilies,
+    })),
+  });
+});
+
+app.post(
+  '/api/blind-sheet/register-count',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+  const {
+    locationId,
+    scheduledDate,
+    countNumber,
+    documentUid,
+    assignedCounterId,
+    productIds,
+    familyLabel,
+    rubroLabel,
+    actionType,
+  } = req.body as {
+    locationId?: number;
+    scheduledDate?: string;
+    countNumber?: string;
+    documentUid?: string;
+    assignedCounterId?: number | null;
+    productIds?: number[];
+    familyLabel?: string;
+    rubroLabel?: string;
+    actionType?: 'PRINT' | 'PDF';
+  };
+
+  const locId = parsePositiveInt(locationId);
+  if (!locId) {
+    res.status(400).json({
+      error: 'Debe seleccionar un Depósito / Ubicación específico para validar e ingresar el conteo.',
+    });
+    return;
+  }
+
+  if (!Array.isArray(productIds) || productIds.length === 0) {
+    res.status(400).json({ error: 'Debe seleccionar al menos un artículo para registrar el conteo.' });
+    return;
+  }
+
+  const uniqueProductIds = Array.from(
+    new Set(productIds.map((id) => parsePositiveInt(id)).filter((id): id is number => id !== null))
+  );
+  if (uniqueProductIds.length === 0) {
+    res.status(400).json({ error: 'Los artículos seleccionados no son válidos.' });
+    return;
+  }
+
+  const loc = db.prepare('SELECT * FROM locations WHERE id = ?').get(locId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!loc) {
+    res.status(404).json({ error: 'Ubicación no encontrada.' });
+    return;
+  }
+
+  if (req.user!.role !== UserRole.JEFE_STOCK && !userCanAccessLocation(req.user!, locId)) {
+    res.status(403).json({
+      error: 'No tiene permisos para validar e ingresar conteos en la ubicación seleccionada.',
+    });
+    return;
+  }
+
+  const cleanDocUid = String(documentUid || '').trim().slice(0, 64);
+
+  // Idempotency: if this blind sheet documentUid was already validated & registered, reuse it cleanly
+  if (cleanDocUid) {
+    const existingByUid = db
+      .prepare('SELECT id, count_number, document_uid, status, location_id, assigned_counter_id FROM counts WHERE document_uid = ?')
+      .get(cleanDocUid) as
+      | {
+          id: number;
+          count_number: string;
+          document_uid: string;
+          status: CountStatus;
+          location_id: number;
+          assigned_counter_id: number | null;
+        }
+      | undefined;
+
+    if (existingByUid) {
+      if (
+        req.user!.role === UserRole.CONTADOR &&
+        Number(existingByUid.assigned_counter_id) !== req.user!.id
+      ) {
+        res.status(403).json({ error: 'No tiene permisos sobre esta planilla ya registrada.' });
+        return;
+      }
+      if (
+        req.user!.role === UserRole.RESPONSABLE_DEPOSITO &&
+        !userCanAccessLocation(req.user!, Number(existingByUid.location_id))
+      ) {
+        res.status(403).json({ error: 'No tiene permisos sobre la ubicación de esta planilla.' });
+        return;
+      }
+
+      db.prepare(
+        `UPDATE counts SET
+          blind_printed_at = COALESCE(blind_printed_at, datetime('now')),
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(existingByUid.id);
+
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'BLIND_SHEET_VALIDATED_REPRINTED',
+        entityType: 'COUNT',
+        entityId: existingByUid.id,
+        locationId: Number(existingByUid.location_id),
+        newValue: {
+          countNumber: existingByUid.count_number,
+          documentUid: existingByUid.document_uid,
+          actionType: actionType || 'PRINT',
+        },
+        ipAddress: getClientIp(req),
+      });
+
+      res.json({
+        ok: true,
+        alreadyRegistered: true,
+        countId: existingByUid.id,
+        countNumber: existingByUid.count_number,
+        documentUid: existingByUid.document_uid,
+        status: existingByUid.status,
+      });
+      return;
+    }
+  }
+
+  let resolvedCounterId: number | null = null;
+  if (req.user!.role === UserRole.CONTADOR) {
+    const checkSelf = validateCounterAssignmentForCount(req.user!.id, locId, uniqueProductIds);
+    if (!checkSelf.ok) {
+      res.status(checkSelf.status).json({ error: checkSelf.error });
+      return;
+    }
+    resolvedCounterId = req.user!.id;
+  } else if (assignedCounterId !== undefined && assignedCounterId !== null && Number(assignedCounterId) > 0) {
+    const checkCounter = validateCounterAssignmentForCount(
+      Number(assignedCounterId),
+      locId,
+      uniqueProductIds
+    );
+    if (!checkCounter.ok) {
+      res.status(checkCounter.status).json({ error: checkCounter.error });
+      return;
+    }
+    resolvedCounterId = Number(assignedCounterId);
+  } else if (req.user!.role === UserRole.JEFE_STOCK) {
+    resolvedCounterId = req.user!.id;
+  }
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const cleanDate =
+    scheduledDate && /^\d{4}-\d{2}-\d{2}$/.test(scheduledDate.trim())
+      ? scheduledDate.trim()
+      : todayIso;
+
+  const requestedCountNum = String(countNumber || '').trim().slice(0, 40);
+  const existingNum = requestedCountNum
+    ? db.prepare('SELECT id FROM counts WHERE count_number = ?').get(requestedCountNum)
+    : undefined;
+  const finalCountNumber =
+    requestedCountNum && !existingNum
+      ? requestedCountNum
+      : nextSequenceNumber('CNT', 'counts', 'count_number');
+
+  const finalDocumentUid = cleanDocUid || `BLD-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
+  const actionLabel = actionType === 'PDF' ? 'Descarga PDF' : 'Impresión';
+  const tagParts = [familyLabel?.trim(), rubroLabel?.trim()].filter(
+    (v) => v && v !== 'Todas las familias' && v !== 'Todos los rubros'
+  );
+  const weeklyGoalTag =
+    tagParts.length > 0 ? `Planilla Ciego (${tagParts.join(' · ')})` : 'Planilla Conteo Ciego';
+
+  const warehouseMgrId =
+    req.user!.role === UserRole.RESPONSABLE_DEPOSITO
+      ? req.user!.id
+      : (loc.manager_user_id as number | null) || null;
+
+  const registerTx = db.transaction(() => {
+    const info = db
+      .prepare(
+        `INSERT INTO counts (
+          count_number, document_uid, location_id, scheduled_date,
+          assigned_counter_id, warehouse_manager_id, created_by_user_id,
+          status, weekly_goal_tag, blind_printed_at, executed_at,
+          started_by_user_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'EN_EJECUCION', ?, datetime('now'), datetime('now'), ?, datetime('now'))`
+      )
+      .run(
+        finalCountNumber,
+        finalDocumentUid,
+        locId,
+        cleanDate,
+        resolvedCounterId,
+        warehouseMgrId,
+        req.user!.id,
+        weeklyGoalTag,
+        req.user!.id
+      );
+
+    const countId = Number(info.lastInsertRowid);
+    const insertItem = db.prepare(
+      `INSERT INTO count_items (
+        count_id, product_id, snapshot_erp_stock, snapshot_committed_stock,
+        snapshot_cost_price, historical_alert_text
+      ) VALUES (?, ?, ?, ?, ?, ?)`
+    );
+
+    let insertedItems = 0;
+    for (const pid of uniqueProductIds) {
+      let bal = db
+        .prepare(
+          `SELECT ib.erp_physical_stock, ib.committed_stock, p.cost_price
+           FROM inventory_balances ib
+           JOIN products p ON p.id = ib.product_id
+           WHERE ib.product_id = ? AND ib.location_id = ?`
+        )
+        .get(pid, locId) as
+        | { erp_physical_stock: number; committed_stock: number; cost_price: number | null }
+        | undefined;
+
+      if (!bal) {
+        const prod = db
+          .prepare('SELECT id, cost_price FROM products WHERE id = ?')
+          .get(pid) as { id: number; cost_price: number | null } | undefined;
+        if (!prod) continue;
+        db.prepare(
+          `INSERT OR IGNORE INTO inventory_balances (
+            product_id, location_id, erp_physical_stock, committed_stock, review_stock, damaged_stock, available_stock
+          ) VALUES (?, ?, 0, 0, 0, 0, 0)`
+        ).run(pid, locId);
+        bal = { erp_physical_stock: 0, committed_stock: 0, cost_price: prod.cost_price };
+      }
+
+      const alertText = buildHistoricalAlertForItem(pid, locId);
+      insertItem.run(
+        countId,
+        pid,
+        bal.erp_physical_stock,
+        bal.committed_stock,
+        bal.cost_price,
+        alertText
+      );
+      insertedItems += 1;
+    }
+
+    if (insertedItems === 0) {
+      throw new Error('Ninguno de los artículos seleccionados existe en el catálogo maestro.');
+    }
+
+    recordCountStateTransition({
+      countId,
+      locationId: locId,
+      previousStatus: null,
+      newStatus: CountStatus.EN_EJECUCION,
+      user: req.user!,
+      reason: `Planilla de conteo ciego validada e ingresada mediante ${actionLabel} (${insertedItems} artículo/s). Habilitada para Gestión de Conteos y Conciliación.`,
+      metadata: {
+        countNumber: finalCountNumber,
+        documentUid: finalDocumentUid,
+        actionType: actionType || 'PRINT',
+        assignedCounterId: resolvedCounterId,
+        itemsCount: insertedItems,
+      },
+      ipAddress: getClientIp(req),
+    });
+
+    if (resolvedCounterId && resolvedCounterId !== req.user!.id) {
+      createNotification({
+        targetUserId: resolvedCounterId,
+        severity: 'INFO',
+        title: `Planilla ciega validada: ${finalCountNumber}`,
+        message: `Conteo en ${loc.name} (${insertedItems} artículos) emitido por ${actionLabel} y habilitado para carga de conciliación.`,
+        entityType: 'COUNT',
+        entityId: countId,
+      });
+    }
+
+    if (req.user!.role !== UserRole.JEFE_STOCK) {
+      createNotification({
+        targetRole: UserRole.JEFE_STOCK,
+        severity: 'INFO',
+        title: `Planilla ciega validada: ${finalCountNumber}`,
+        message: `${req.user!.fullName} emitió planilla ciega (${actionLabel}) en ${loc.name} (${insertedItems} artículos) ingresada a Gestión y Conciliación.`,
+        entityType: 'COUNT',
+        entityId: countId,
+      });
+    }
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'BLIND_SHEET_VALIDATED_AND_REGISTERED',
+      entityType: 'COUNT',
+      entityId: countId,
+      locationId: locId,
+      newValue: {
+        countNumber: finalCountNumber,
+        documentUid: finalDocumentUid,
+        status: CountStatus.EN_EJECUCION,
+        actionType: actionType || 'PRINT',
+        assignedCounterId: resolvedCounterId,
+        itemsCount: insertedItems,
+      },
+      ipAddress: getClientIp(req),
+    });
+
+    return {
+      ok: true,
+      alreadyRegistered: false,
+      countId,
+      countNumber: finalCountNumber,
+      documentUid: finalDocumentUid,
+      status: CountStatus.EN_EJECUCION,
+      itemsCount: insertedItems,
+    };
+  });
+
+  const result = registerTx();
+  res.status(201).json(result);
+});
+
+const ALLOWED_COUNT_TRANSITIONS: Record<CountStatus, CountStatus[]> = {
+  [CountStatus.BORRADOR]: [CountStatus.ASIGNADO],
+  [CountStatus.ASIGNADO]: [CountStatus.EN_EJECUCION],
+  [CountStatus.EN_EJECUCION]: [CountStatus.PENDIENTE_APROBACION],
+  [CountStatus.PENDIENTE_APROBACION]: [CountStatus.APROBADO, CountStatus.RECHAZADO],
+  [CountStatus.RECHAZADO]: [CountStatus.EN_EJECUCION, CountStatus.PENDIENTE_APROBACION],
+  [CountStatus.APROBADO]: [CountStatus.PENDIENTE_REGULARIZACION, CountStatus.CERRADO],
+  [CountStatus.PENDIENTE_REGULARIZACION]: [CountStatus.CERRADO],
+  [CountStatus.CERRADO]: [],
+};
+
+const BLIND_COUNTER_RESTRICTED_STATUSES = new Set<string>([
+  CountStatus.BORRADOR,
+  CountStatus.ASIGNADO,
+  CountStatus.EN_EJECUCION,
+  CountStatus.RECHAZADO,
+]);
+
+function recordCountStateTransition(params: {
+  countId: number;
+  locationId: number | null;
+  previousStatus: string | null;
+  newStatus: CountStatus;
+  user: AuthUser;
+  reason: string;
+  metadata?: unknown;
+  ipAddress?: string;
+}): void {
+  db.prepare(
+    `INSERT INTO count_state_history (
+      count_id, previous_status, new_status, changed_by_user_id,
+      changed_by_username, reason, metadata_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    params.countId,
+    params.previousStatus,
+    params.newStatus,
+    params.user.id,
+    params.user.username,
+    params.reason.trim(),
+    params.metadata !== undefined ? JSON.stringify(params.metadata) : null
+  );
+
+  logAudit({
+    userId: params.user.id,
+    username: params.user.username,
+    action: 'COUNT_STATE_TRANSITION',
+    entityType: 'COUNT',
+    entityId: params.countId,
+    locationId: params.locationId,
+    oldValue: params.previousStatus ? { status: params.previousStatus } : null,
+    newValue: {
+      status: params.newStatus,
+      reason: params.reason.trim(),
+      ...(typeof params.metadata === 'object' && params.metadata !== null ? params.metadata : {}),
+    },
+    ipAddress: params.ipAddress,
+  });
+}
+
+function getAttachmentsCountForCount(countId: number): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as cnt FROM attachments
+       WHERE (entity_type IN ('COUNT_SHEET', 'ADJUSTMENT') AND entity_id = ?)
+          OR (entity_type = 'COUNT_ITEM' AND entity_id IN (SELECT id FROM count_items WHERE count_id = ?))`
+    )
+    .get(countId, countId) as { cnt: number };
+  return Number(row.cnt || 0);
+}
+
+function getDocumentaryEvidenceCountForCount(countId: number): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as cnt FROM attachments
+       WHERE (entity_type IN ('COUNT_SHEET', 'ADJUSTMENT') AND entity_id = ?)
+          OR (entity_type = 'COUNT_ITEM' AND entity_id IN (SELECT id FROM count_items WHERE count_id = ?))`
+    )
+    .get(countId, countId) as { cnt: number };
+  return Number(row.cnt || 0);
+}
+
 app.get('/api/counts', requireAuth, (req: AuthenticatedRequest, res) => {
   const statusFilter = String(req.query.status || '').trim();
-  const locationId = req.query.locationId ? Number(req.query.locationId) : null;
+  const locationGroupFilter = String(req.query.locationGroup || '').trim();
+  const locationId = req.query.locationId ? parsePositiveInt(req.query.locationId) : null;
+  const counterId = req.query.counterId ? parsePositiveInt(req.query.counterId) : null;
+  const dateFrom = String(req.query.dateFrom || '').trim();
+  const dateTo = String(req.query.dateTo || '').trim();
+  const countNumberFilter = String(req.query.countNumber || '').trim();
+
+  if (
+    locationId &&
+    req.user!.role === UserRole.RESPONSABLE_DEPOSITO &&
+    !userCanAccessLocation(req.user!, locationId)
+  ) {
+    res.status(403).json({ error: 'No tiene permisos para consultar conteos de esta ubicación.' });
+    return;
+  }
 
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -1218,25 +1990,55 @@ app.get('/api/counts', requireAuth, (req: AuthenticatedRequest, res) => {
     conditions.push('c.status = ?');
     params.push(statusFilter);
   }
+  if (locationGroupFilter) {
+    conditions.push('l.group_type = ?');
+    params.push(locationGroupFilter);
+  }
   if (locationId) {
     conditions.push('c.location_id = ?');
     params.push(locationId);
+  }
+  if (counterId) {
+    conditions.push('c.assigned_counter_id = ?');
+    params.push(counterId);
+  }
+  if (dateFrom) {
+    conditions.push('c.scheduled_date >= ?');
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    conditions.push('c.scheduled_date <= ?');
+    params.push(dateTo);
+  }
+  if (countNumberFilter) {
+    conditions.push('UPPER(c.count_number) LIKE ?');
+    params.push(`%${countNumberFilter.toUpperCase()}%`);
   }
 
   const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = db
     .prepare(
       `SELECT c.*, l.name as location_name, l.code as location_code, l.group_type as location_group,
-        uc.full_name as counter_name, uw.full_name as warehouse_manager_name,
+        COALESCE(uc.full_name, 'Sin asignar') as counter_name,
+        uw.full_name as warehouse_manager_name,
+        ucb.full_name as created_by_name,
         (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id) as items_count,
-        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.final_counted_qty IS NOT NULL) as counted_items_count,
-        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE')) as discrepancies_count
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND (ci.final_counted_qty IS NOT NULL OR ci.is_not_counted = 1)) as counted_items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.is_not_counted = 1) as not_counted_items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE')) as discrepancies_count,
+        (SELECT COUNT(*) FROM count_submissions cs WHERE cs.count_id = c.id) as submissions_count,
+        (
+          SELECT COUNT(*) FROM attachments a
+          WHERE (a.entity_type IN ('COUNT_SHEET', 'ADJUSTMENT') AND a.entity_id = c.id)
+             OR (a.entity_type = 'COUNT_ITEM' AND a.entity_id IN (SELECT ci2.id FROM count_items ci2 WHERE ci2.count_id = c.id))
+        ) as attachments_count
        FROM counts c
        JOIN locations l ON l.id = c.location_id
-       JOIN users uc ON uc.id = c.assigned_counter_id
+       LEFT JOIN users uc ON uc.id = c.assigned_counter_id
        LEFT JOIN users uw ON uw.id = c.warehouse_manager_id
+       LEFT JOIN users ucb ON ucb.id = c.created_by_user_id
        ${whereSql}
-       ORDER BY c.scheduled_date DESC, c.id DESC`
+       ORDER BY c.updated_at DESC, c.scheduled_date DESC, c.id DESC`
     )
     .all(...params) as Array<Record<string, unknown>>;
 
@@ -1244,7 +2046,7 @@ app.get('/api/counts', requireAuth, (req: AuthenticatedRequest, res) => {
   const sanitized = rows.map((r) => {
     if (
       req.user!.role === UserRole.CONTADOR &&
-      ['PROGRAMADO', 'EN_PROGRESO', 'RECONTEO_SOLICITADO'].includes(String(r.status))
+      BLIND_COUNTER_RESTRICTED_STATUSES.has(String(r.status))
     ) {
       return { ...r, discrepancies_count: null };
     }
@@ -1254,18 +2056,108 @@ app.get('/api/counts', requireAuth, (req: AuthenticatedRequest, res) => {
   res.json({ counts: sanitized });
 });
 
+function validateCounterAssignmentForCount(
+  counterId: number,
+  locationId: number,
+  productIds: number[]
+): { ok: true; counterUser: AuthUser } | { ok: false; status: number; error: string } {
+  const counterRow = db.prepare('SELECT * FROM users WHERE id = ?').get(counterId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!counterRow || !counterRow.is_active) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'El responsable de conteo seleccionado no existe o está deshabilitado.',
+    };
+  }
+  const counterUser = mapDbUser(counterRow);
+  if (counterUser.role !== UserRole.CONTADOR && counterUser.role !== UserRole.JEFE_STOCK) {
+    return {
+      ok: false,
+      status: 400,
+      error: `El usuario "${counterUser.username}" no tiene rol habilitado para ejecutar conteos.`,
+    };
+  }
+  if (
+    counterUser.role === UserRole.CONTADOR &&
+    !userCanAccessLocation(counterUser, locationId)
+  ) {
+    return {
+      ok: false,
+      status: 403,
+      error: `El responsable "${counterUser.fullName}" no tiene autorización asignada sobre este depósito.`,
+    };
+  }
+  if (
+    counterUser.role === UserRole.CONTADOR &&
+    counterUser.assignedFamilies.length > 0 &&
+    productIds.length > 0
+  ) {
+    const allowedFams = new Set(counterUser.assignedFamilies.map((f) => f.trim().toLowerCase()));
+    const prodRows = db
+      .prepare(
+        `SELECT id, sku, family FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`
+      )
+      .all(...productIds) as Array<{ id: number; sku: string; family: string }>;
+
+    const unauthorized = prodRows.find((p) => !allowedFams.has(String(p.family || '').trim().toLowerCase()));
+    if (unauthorized) {
+      return {
+        ok: false,
+        status: 403,
+        error: `El artículo ${unauthorized.sku} (familia "${unauthorized.family}") no corresponde a las familias asignadas a ${counterUser.fullName}.`,
+      };
+    }
+  }
+  return { ok: true, counterUser };
+}
+
+function getPostSnapshotMovementsForCount(
+  countId: number,
+  locationId: number,
+  createdAt: string,
+  productIds: number[]
+): Array<Record<string, unknown>> {
+  if (productIds.length === 0) return [];
+  return db
+    .prepare(
+      `SELECT im.*, p.sku, p.description
+       FROM inventory_movements im
+       JOIN products p ON p.id = im.product_id
+       WHERE im.location_id = ?
+         AND im.product_id IN (${productIds.map(() => '?').join(',')})
+         AND im.created_at > ?
+         AND NOT (im.reference_type = 'COUNT_CLOSURE' AND im.reference_id = ?)
+       ORDER BY im.created_at DESC`
+    )
+    .all(locationId, ...productIds, createdAt, String(countId)) as Array<Record<string, unknown>>;
+}
+
 app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-  const countId = Number(req.params.id);
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
   const countRow = db
     .prepare(
       `SELECT c.*, l.name as location_name, l.code as location_code, l.group_type as location_group,
-        uc.full_name as counter_name, uc.username as counter_username,
-        uw.full_name as warehouse_manager_name, ucb.full_name as created_by_name
+        COALESCE(uc.full_name, 'Sin asignar') as counter_name, uc.username as counter_username,
+        uw.full_name as warehouse_manager_name, ucb.full_name as created_by_name,
+        usub.full_name as submitted_by_name,
+        ua.full_name as approved_by_name,
+        urj.full_name as rejected_by_name,
+        ucl.full_name as closed_by_name
        FROM counts c
        JOIN locations l ON l.id = c.location_id
-       JOIN users uc ON uc.id = c.assigned_counter_id
+       LEFT JOIN users uc ON uc.id = c.assigned_counter_id
        LEFT JOIN users uw ON uw.id = c.warehouse_manager_id
        JOIN users ucb ON ucb.id = c.created_by_user_id
+       LEFT JOIN users usub ON usub.id = c.submitted_by_user_id
+       LEFT JOIN users ua ON ua.id = c.approved_by_user_id
+       LEFT JOIN users urj ON urj.id = c.rejected_by_user_id
+       LEFT JOIN users ucl ON ucl.id = c.closed_by_user_id
        WHERE c.id = ?`
     )
     .get(countId) as Record<string, unknown> | undefined;
@@ -1305,7 +2197,8 @@ app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
 
   const isBlindStageForCounter =
     req.user!.role !== UserRole.JEFE_STOCK &&
-    ['PROGRAMADO', 'EN_PROGRESO', 'RECONTEO_SOLICITADO'].includes(String(countRow.status));
+    req.user!.role !== UserRole.AUDITORIA_DIRECCION &&
+    BLIND_COUNTER_RESTRICTED_STATUSES.has(String(countRow.status));
 
   const items = rawItems.map((it) => {
     const attachments = db
@@ -1326,6 +2219,8 @@ app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
         bulk_qty: it.bulk_qty,
         loose_qty: it.loose_qty,
         counted_qty: it.counted_qty,
+        is_not_counted: it.is_not_counted,
+        not_counted_reason: it.not_counted_reason,
         recount_bulk_qty: it.recount_bulk_qty,
         recount_loose_qty: it.recount_loose_qty,
         recount_qty: it.recount_qty,
@@ -1346,26 +2241,73 @@ app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
 
   // Check movements occurring after count snapshot creation (Section 15)
   const productIds = rawItems.map((it) => Number(it.product_id));
-  let postSnapshotMovements: Array<Record<string, unknown>> = [];
-  if (productIds.length > 0 && req.user!.role === UserRole.JEFE_STOCK) {
-    postSnapshotMovements = db
-      .prepare(
-        `SELECT im.*, p.sku, p.description
-         FROM inventory_movements im
-         JOIN products p ON p.id = im.product_id
-         WHERE im.location_id = ?
-           AND im.product_id IN (${productIds.map(() => '?').join(',')})
-           AND im.created_at > ?
-         ORDER BY im.created_at DESC`
-      )
-      .all(countRow.location_id, ...productIds, countRow.created_at) as Array<
-      Record<string, unknown>
-    >;
+  const detectedPostMovements = getPostSnapshotMovementsForCount(
+    countId,
+    Number(countRow.location_id),
+    String(countRow.created_at),
+    productIds
+  );
+  const hasPostFlag = detectedPostMovements.length > 0 ? 1 : 0;
+  if (Number(countRow.has_post_snapshot_movements || 0) !== hasPostFlag) {
+    db.prepare('UPDATE counts SET has_post_snapshot_movements = ? WHERE id = ?').run(hasPostFlag, countId);
+    countRow.has_post_snapshot_movements = hasPostFlag;
   }
+  const postSnapshotMovements =
+    req.user!.role === UserRole.JEFE_STOCK || req.user!.role === UserRole.AUDITORIA_DIRECCION
+      ? detectedPostMovements
+      : [];
 
-  const sheetAttachments = db
-    .prepare("SELECT * FROM attachments WHERE entity_type IN ('COUNT_SHEET', 'ADJUSTMENT') AND entity_id = ?")
+  const sheetAttachments =
+    req.user!.role === UserRole.CONTADOR
+      ? db
+          .prepare("SELECT * FROM attachments WHERE entity_type = 'COUNT_SHEET' AND entity_id = ?")
+          .all(countId)
+      : db
+          .prepare("SELECT * FROM attachments WHERE entity_type IN ('COUNT_SHEET', 'ADJUSTMENT') AND entity_id = ?")
+          .all(countId);
+
+  const stateHistory = db
+    .prepare(
+      `SELECT h.*, u.full_name as changed_by_full_name
+       FROM count_state_history h
+       LEFT JOIN users u ON u.id = h.changed_by_user_id
+       WHERE h.count_id = ?
+       ORDER BY h.id DESC`
+    )
     .all(countId);
+
+  const rawSubmissions = db
+    .prepare(
+      `SELECT cs.*, us.full_name as submitted_by_full_name, ur.full_name as reviewed_by_full_name
+       FROM count_submissions cs
+       LEFT JOIN users us ON us.id = cs.submitted_by_user_id
+       LEFT JOIN users ur ON ur.id = cs.reviewed_by_user_id
+       WHERE cs.count_id = ?
+       ORDER BY cs.version_number DESC`
+    )
+    .all(countId) as Array<Record<string, unknown>>;
+
+  const submissions = rawSubmissions.map((sub) => {
+    let parsedItems: Array<Record<string, unknown>> = [];
+    try {
+      parsedItems = JSON.parse(String(sub.items_snapshot_json || '[]'));
+    } catch {
+      parsedItems = [];
+    }
+    if (isBlindStageForCounter) {
+      parsedItems = parsedItems.map((it) => ({
+        ...it,
+        snapshot_erp_stock: null,
+        snapshot_committed_stock: null,
+        difference: null,
+        reconciliation_result: null,
+      }));
+    }
+    return {
+      ...sub,
+      items: parsedItems,
+    };
+  });
 
   res.json({
     count: countRow,
@@ -1373,21 +2315,34 @@ app.get('/api/counts/:id', requireAuth, (req: AuthenticatedRequest, res) => {
     isBlindRestricted: isBlindStageForCounter,
     postSnapshotMovements,
     sheetAttachments,
+    stateHistory,
+    submissions,
   });
 });
 
 app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: AuthenticatedRequest, res) => {
-  const { locationId, scheduledDate, assignedCounterId, productIds, weeklyGoalTag } = req.body as {
-    locationId?: number;
-    scheduledDate?: string;
-    assignedCounterId?: number;
-    productIds?: number[];
-    weeklyGoalTag?: string;
-  };
+  const { locationId, scheduledDate, assignedCounterId, productIds, weeklyGoalTag, saveAsDraft } =
+    req.body as {
+      locationId?: number;
+      scheduledDate?: string;
+      assignedCounterId?: number | null;
+      productIds?: number[];
+      weeklyGoalTag?: string;
+      saveAsDraft?: boolean;
+    };
 
-  if (!locationId || !scheduledDate || !assignedCounterId || !Array.isArray(productIds) || productIds.length === 0) {
+  const isDraft = Boolean(saveAsDraft || !assignedCounterId);
+
+  if (!locationId || !scheduledDate || !Array.isArray(productIds) || productIds.length === 0) {
     res.status(400).json({
-      error: 'Ubicación, fecha programada, responsable de conteo y al menos un artículo son requeridos.',
+      error: 'Ubicación, fecha programada y al menos un artículo son requeridos.',
+    });
+    return;
+  }
+
+  if (!saveAsDraft && !assignedCounterId) {
+    res.status(400).json({
+      error: 'Debe seleccionar un responsable de conteo o guardar el conteo como BORRADOR.',
     });
     return;
   }
@@ -1400,6 +2355,18 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
     return;
   }
 
+  const cleanCounterId = assignedCounterId ? Number(assignedCounterId) : null;
+  if (cleanCounterId) {
+    const check = validateCounterAssignmentForCount(cleanCounterId, Number(locationId), productIds);
+    if (!check.ok) {
+      res.status(check.status).json({ error: check.error });
+      return;
+    }
+  }
+
+  const initialStatus: CountStatus =
+    isDraft && !cleanCounterId ? CountStatus.BORRADOR : CountStatus.ASIGNADO;
+
   const countNumber = nextSequenceNumber('CNT', 'counts', 'count_number');
   const documentUid = `DOC-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
 
@@ -1409,17 +2376,18 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
         `INSERT INTO counts (
           count_number, document_uid, location_id, scheduled_date,
           assigned_counter_id, warehouse_manager_id, created_by_user_id,
-          status, weekly_goal_tag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PROGRAMADO', ?)`
+          status, weekly_goal_tag, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
       )
       .run(
         countNumber,
         documentUid,
         locationId,
         scheduledDate,
-        assignedCounterId,
+        cleanCounterId,
         loc.manager_user_id || null,
         req.user!.id,
+        initialStatus,
         (weeklyGoalTag || '').trim()
       );
 
@@ -1467,14 +2435,40 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
       );
     }
 
-    createNotification({
-      targetUserId: assignedCounterId,
-      severity: 'INFO',
-      title: `Nuevo conteo asignado: ${countNumber}`,
-      message: `Se programó conteo ciego en ${loc.name} para el ${scheduledDate} (${productIds.length} artículos).`,
-      entityType: 'COUNT',
-      entityId: countId,
-    });
+    if (initialStatus === CountStatus.BORRADOR) {
+      recordCountStateTransition({
+        countId,
+        locationId: Number(locationId),
+        previousStatus: null,
+        newStatus: CountStatus.BORRADOR,
+        user: req.user!,
+        reason: `Conteo creado en borrador (${productIds.length} artículos, sin asignar).`,
+        metadata: { countNumber, itemsCount: productIds.length },
+        ipAddress: getClientIp(req),
+      });
+    } else {
+      recordCountStateTransition({
+        countId,
+        locationId: Number(locationId),
+        previousStatus: null,
+        newStatus: CountStatus.ASIGNADO,
+        user: req.user!,
+        reason: `Conteo creado y asignado al responsable ID ${cleanCounterId}.`,
+        metadata: { countNumber, assignedCounterId: cleanCounterId, itemsCount: productIds.length },
+        ipAddress: getClientIp(req),
+      });
+
+      if (cleanCounterId) {
+        createNotification({
+          targetUserId: cleanCounterId,
+          severity: 'INFO',
+          title: `Nuevo conteo asignado: ${countNumber}`,
+          message: `Se asignó conteo ciego en ${loc.name} para el ${scheduledDate} (${productIds.length} artículos).`,
+          entityType: 'COUNT',
+          entityId: countId,
+        });
+      }
+    }
 
     logAudit({
       userId: req.user!.id,
@@ -1482,12 +2476,18 @@ app.post('/api/counts', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: Aut
       action: 'COUNT_CREATED',
       entityType: 'COUNT',
       entityId: countId,
-      locationId,
-      newValue: { countNumber, scheduledDate, assignedCounterId, itemsCount: productIds.length },
+      locationId: Number(locationId),
+      newValue: {
+        countNumber,
+        scheduledDate,
+        status: initialStatus,
+        assignedCounterId: cleanCounterId,
+        itemsCount: productIds.length,
+      },
       ipAddress: getClientIp(req),
     });
 
-    return { countId, countNumber, documentUid };
+    return { countId, countNumber, documentUid, status: initialStatus };
   });
 
   const created = createTx();
@@ -1519,6 +2519,19 @@ app.post(
       return;
     }
 
+    for (const a of assignments) {
+      if (!a.productIds || a.productIds.length === 0) continue;
+      const check = validateCounterAssignmentForCount(
+        Number(a.counterId),
+        Number(locationId),
+        a.productIds
+      );
+      if (!check.ok) {
+        res.status(check.status).json({ error: check.error });
+        return;
+      }
+    }
+
     const createdCounts: Array<{ countId: number; countNumber: string; counterId: number }> = [];
 
     const tx = db.transaction(() => {
@@ -1532,8 +2545,8 @@ app.post(
             `INSERT INTO counts (
               count_number, document_uid, location_id, scheduled_date,
               assigned_counter_id, warehouse_manager_id, created_by_user_id,
-              status, weekly_goal_tag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PROGRAMADO', ?)`
+              status, weekly_goal_tag, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ASIGNADO', ?, datetime('now'))`
           )
           .run(
             countNumber,
@@ -1590,6 +2603,17 @@ app.post(
           );
         }
 
+        recordCountStateTransition({
+          countId,
+          locationId: Number(locationId),
+          previousStatus: null,
+          newStatus: CountStatus.ASIGNADO,
+          user: req.user!,
+          reason: `Conteo generado y asignado por planificación inteligente (${a.productIds.length} artículos).`,
+          metadata: { countNumber, assignedCounterId: a.counterId },
+          ipAddress: getClientIp(req),
+        });
+
         createNotification({
           targetUserId: a.counterId,
           severity: 'INFO',
@@ -1608,24 +2632,269 @@ app.post(
   }
 );
 
-app.post('/api/counts/:id/mark-printed', requireAuth, (req: AuthenticatedRequest, res) => {
-  const countId = Number(req.params.id);
-  db.prepare(
-    "UPDATE counts SET blind_printed_at = COALESCE(blind_printed_at, datetime('now')), status = CASE WHEN status = 'PROGRAMADO' THEN 'EN_PROGRESO' ELSE status END WHERE id = ?"
-  ).run(countId);
+app.post(
+  '/api/counts/:id/assign',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  (req: AuthenticatedRequest, res) => {
+    const countId = parsePositiveInt(req.params.id);
+    if (!countId) {
+      res.status(400).json({ error: 'Identificador de conteo inválido.' });
+      return;
+    }
+    const { assignedCounterId, reason } = req.body as {
+      assignedCounterId?: number;
+      reason?: string;
+    };
+    if (!assignedCounterId) {
+      res.status(400).json({ error: 'Debe seleccionar un responsable de conteo.' });
+      return;
+    }
+
+    const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!countRow) {
+      res.status(404).json({ error: 'Conteo no encontrado.' });
+      return;
+    }
+    if (countRow.status === CountStatus.CERRADO) {
+      res.status(403).json({ error: 'El conteo está cerrado y no puede reasignarse.' });
+      return;
+    }
+    const canAssignInExec =
+      countRow.status === CountStatus.EN_EJECUCION && !countRow.assigned_counter_id;
+    if (
+      countRow.status !== CountStatus.BORRADOR &&
+      countRow.status !== CountStatus.ASIGNADO &&
+      !canAssignInExec
+    ) {
+      res.status(400).json({
+        error: `Solo se puede asignar o cambiar responsable en estado BORRADOR, ASIGNADO o EN_EJECUCION sin asignar (estado actual: ${countRow.status}).`,
+      });
+      return;
+    }
+
+    const productIds = (
+      db.prepare('SELECT product_id FROM count_items WHERE count_id = ?').all(countId) as Array<{
+        product_id: number;
+      }>
+    ).map((r) => r.product_id);
+
+    const check = validateCounterAssignmentForCount(
+      Number(assignedCounterId),
+      Number(countRow.location_id),
+      productIds
+    );
+    if (!check.ok) {
+      res.status(check.status).json({ error: check.error });
+      return;
+    }
+
+    const prevStatus = String(countRow.status);
+    const nextStatus =
+      prevStatus === CountStatus.EN_EJECUCION ? CountStatus.EN_EJECUCION : CountStatus.ASIGNADO;
+    const assignTx = db.transaction(() => {
+      db.prepare(
+        `UPDATE counts SET
+          assigned_counter_id = ?,
+          status = ?,
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(Number(assignedCounterId), nextStatus, countId);
+
+      recordCountStateTransition({
+        countId,
+        locationId: Number(countRow.location_id),
+        previousStatus: prevStatus,
+        newStatus: nextStatus,
+        user: req.user!,
+        reason:
+          reason?.trim() ||
+          `Asignado al responsable ${check.counterUser.fullName} (${check.counterUser.username}).`,
+        metadata: { assignedCounterId: Number(assignedCounterId) },
+        ipAddress: getClientIp(req),
+      });
+
+      createNotification({
+        targetUserId: Number(assignedCounterId),
+        severity: 'INFO',
+        title: `Conteo asignado: ${countRow.count_number}`,
+        message: `Se le asignó el conteo ${countRow.count_number} (${productIds.length} artículos) programado para ${countRow.scheduled_date}.`,
+        entityType: 'COUNT',
+        entityId: countId,
+      });
+    });
+
+    assignTx();
+    res.json({ ok: true, status: nextStatus });
+  }
+);
+
+app.post(
+  '/api/counts/:id/start',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
+  (req: AuthenticatedRequest, res) => {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
+  const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!countRow) {
+    res.status(404).json({ error: 'Conteo no encontrado.' });
+    return;
+  }
+  if (countRow.status === CountStatus.CERRADO) {
+    res.status(403).json({ error: 'El conteo está cerrado.' });
+    return;
+  }
+  if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO) {
+    res.status(403).json({ error: 'El responsable de depósito no inicia la ejecución del conteo físico.' });
+    return;
+  }
+  if (
+    req.user!.role === UserRole.CONTADOR &&
+    Number(countRow.assigned_counter_id) !== req.user!.id
+  ) {
+    res.status(403).json({ error: 'Solo el contador asignado puede iniciar este conteo.' });
+    return;
+  }
+
+  const prevStatus = String(countRow.status);
+  if (prevStatus !== CountStatus.ASIGNADO && prevStatus !== CountStatus.RECHAZADO) {
+    res.status(400).json({
+      error: `No es posible iniciar ejecución desde el estado ${prevStatus}.`,
+    });
+    return;
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `UPDATE counts SET
+        status = 'EN_EJECUCION',
+        executed_at = COALESCE(executed_at, datetime('now')),
+        started_by_user_id = COALESCE(started_by_user_id, ?),
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(req.user!.id, countId);
+
+    recordCountStateTransition({
+      countId,
+      locationId: Number(countRow.location_id),
+      previousStatus: prevStatus,
+      newStatus: CountStatus.EN_EJECUCION,
+      user: req.user!,
+      reason:
+        prevStatus === CountStatus.RECHAZADO
+          ? 'El contador reanudó la ejecución para corregir el conteo rechazado.'
+          : 'El contador inició la ejecución del conteo.',
+      ipAddress: getClientIp(req),
+    });
+  });
+
+  tx();
+  res.json({ ok: true, status: CountStatus.EN_EJECUCION });
+});
+
+app.post(
+  '/api/counts/:id/mark-printed',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
+
+  const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!countRow) {
+    res.status(404).json({ error: 'Conteo no encontrado.' });
+    return;
+  }
+
+  if (
+    req.user!.role === UserRole.CONTADOR &&
+    Number(countRow.assigned_counter_id) !== req.user!.id
+  ) {
+    res.status(403).json({ error: 'Solo el responsable asignado o el Jefe puede imprimir este conteo.' });
+    return;
+  }
+  if (
+    req.user!.role === UserRole.RESPONSABLE_DEPOSITO &&
+    !userCanAccessLocation(req.user!, Number(countRow.location_id))
+  ) {
+    res.status(403).json({ error: 'No tiene permisos sobre la ubicación de este conteo.' });
+    return;
+  }
+
+  if (countRow.status !== CountStatus.CERRADO) {
+    const prevStatus = String(countRow.status);
+    const shouldMoveToExecution =
+      req.user!.role !== UserRole.RESPONSABLE_DEPOSITO &&
+      (prevStatus === CountStatus.ASIGNADO || prevStatus === CountStatus.RECHAZADO);
+
+    const printTx = db.transaction(() => {
+      db.prepare(
+        `UPDATE counts SET
+          blind_printed_at = COALESCE(blind_printed_at, datetime('now')),
+          executed_at = CASE WHEN ? THEN COALESCE(executed_at, datetime('now')) ELSE executed_at END,
+          started_by_user_id = CASE WHEN ? THEN COALESCE(started_by_user_id, ?) ELSE started_by_user_id END,
+          status = CASE WHEN ? THEN 'EN_EJECUCION' ELSE status END,
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        shouldMoveToExecution ? 1 : 0,
+        shouldMoveToExecution ? 1 : 0,
+        req.user!.id,
+        shouldMoveToExecution ? 1 : 0,
+        countId
+      );
+
+      if (shouldMoveToExecution) {
+        recordCountStateTransition({
+          countId,
+          locationId: Number(countRow.location_id),
+          previousStatus: prevStatus,
+          newStatus: CountStatus.EN_EJECUCION,
+          user: req.user!,
+          reason: 'Inicio automático de ejecución al imprimir planilla ciega.',
+          ipAddress: getClientIp(req),
+        });
+      }
+    });
+    printTx();
+  }
+
   logAudit({
     userId: req.user!.id,
     username: req.user!.username,
     action: 'BLIND_SHEET_PRINTED',
     entityType: 'COUNT',
     entityId: countId,
+    locationId: Number(countRow.location_id),
     ipAddress: getClientIp(req),
   });
   res.json({ ok: true });
 });
 
-app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedRequest, res) => {
-  const countId = Number(req.params.id);
+function handleCountResultsOrPresentation(
+  req: AuthenticatedRequest,
+  res: express.Response,
+  forcePresent: boolean
+): void {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
+
   const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
     | Record<string, unknown>
     | undefined;
@@ -1639,42 +2908,80 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
     return;
   }
 
-  if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO) {
-    res.status(403).json({ error: 'El responsable de depósito no puede modificar cantidades informadas.' });
+  if (
+    req.user!.role === UserRole.RESPONSABLE_DEPOSITO ||
+    req.user!.role === UserRole.AUDITORIA_DIRECCION
+  ) {
+    res.status(403).json({ error: 'Su perfil no está habilitado para modificar o presentar resultados de conteo.' });
     return;
   }
 
   if (
     req.user!.role === UserRole.CONTADOR &&
-    (Number(countRow.assigned_counter_id) !== req.user!.id ||
-      ![CountStatus.PROGRAMADO, CountStatus.EN_PROGRESO, CountStatus.RECONTEO_SOLICITADO].includes(
-        countRow.status as CountStatus
-      ))
+    Number(countRow.assigned_counter_id) !== req.user!.id
   ) {
     res.status(403).json({
-      error: 'No puede modificar un conteo ya enviado o asignado a otro responsable.',
+      error: 'Los contadores solamente pueden trabajar y presentar sus conteos asignados.',
     });
     return;
   }
 
-  const { items, counterSignatureName, submitForReview } = req.body as {
+  const prevStatus = String(countRow.status);
+  const body = req.body as {
     items?: Array<{
       itemId: number;
       bulkQty?: number | null;
       looseQty?: number | null;
       countedQty?: number | null;
+      isNotCounted?: boolean;
+      notCountedReason?: string;
       observations?: string;
     }>;
     counterSignatureName?: string;
+    generalObservations?: string;
     submitForReview?: boolean;
   };
 
-  if (!Array.isArray(items) || items.length === 0) {
+  const submitForReview = forcePresent || Boolean(body.submitForReview);
+
+  if (submitForReview) {
+    if (
+      prevStatus !== CountStatus.EN_EJECUCION &&
+      prevStatus !== CountStatus.RECHAZADO
+    ) {
+      res.status(400).json({
+        error: `No se puede saltar etapas: el conteo está en estado ${prevStatus}. Debe estar EN EJECUCIÓN o RECHAZADO para presentarlo a aprobación.`,
+      });
+      return;
+    }
+  } else {
+    if (
+      !(
+        [CountStatus.ASIGNADO, CountStatus.EN_EJECUCION, CountStatus.RECHAZADO] as string[]
+      ).includes(prevStatus)
+    ) {
+      res.status(403).json({
+        error: `No se pueden editar cantidades en el estado actual (${prevStatus}).`,
+      });
+      return;
+    }
+  }
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!submitForReview && items.length === 0) {
     res.status(400).json({ error: 'Ingrese las cantidades contadas.' });
     return;
   }
 
-  const isRecount = countRow.status === CountStatus.RECONTEO_SOLICITADO;
+  const isRecount = prevStatus === CountStatus.RECHAZADO;
+  const generalObsTrimmed =
+    body.generalObservations !== undefined
+      ? String(body.generalObservations).trim()
+      : String(countRow.counter_general_notes || '').trim();
+  const counterSigTrimmed =
+    body.counterSignatureName !== undefined
+      ? String(body.counterSignatureName).trim()
+      : String(countRow.counter_signature_name || '').trim();
 
   const parseOptionalNonNeg = (val: unknown): number | null => {
     if (val === null || val === undefined || val === '') return null;
@@ -1692,30 +2999,77 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
         .get(entry.itemId, countId) as Record<string, unknown> | undefined;
       if (!existing) continue;
 
+      const isNotCounted = Boolean(entry.isNotCounted);
+      const notCountedReason = String(entry.notCountedReason || '').trim();
+      const obsText = String(entry.observations ?? '').trim();
+
+      if (isNotCounted) {
+        if (submitForReview && !notCountedReason) {
+          throw new Error(
+            'Todo artículo marcado como "No contado" requiere una justificación obligatoria antes de presentar.'
+          );
+        }
+        if (isRecount) {
+          db.prepare(
+            `UPDATE count_items SET
+              is_not_counted = 1,
+              not_counted_reason = ?,
+              recount_bulk_qty = NULL,
+              recount_loose_qty = NULL,
+              recount_qty = NULL,
+              final_counted_qty = NULL,
+              difference = NULL,
+              reconciliation_result = NULL,
+              counter_observations = COALESCE(NULLIF(?, ''), counter_observations),
+              updated_at = datetime('now')
+             WHERE id = ?`
+          ).run(notCountedReason, obsText, existing.id);
+        } else {
+          db.prepare(
+            `UPDATE count_items SET
+              is_not_counted = 1,
+              not_counted_reason = ?,
+              bulk_qty = NULL,
+              loose_qty = NULL,
+              counted_qty = NULL,
+              final_counted_qty = NULL,
+              difference = NULL,
+              reconciliation_result = NULL,
+              counter_observations = ?,
+              updated_at = datetime('now')
+             WHERE id = ?`
+          ).run(notCountedReason, obsText, existing.id);
+        }
+        continue;
+      }
+
       const parsedBulk = parseOptionalNonNeg(entry.bulkQty);
       const parsedLoose = parseOptionalNonNeg(entry.looseQty);
 
       if (submitForReview && (parsedBulk === null || parsedLoose === null)) {
         throw new Error(
-          'Debe completar tanto la columna "Unidades / Bultos" como "Unidades Sueltas" en todos los artículos antes de enviar el registro.'
+          'Debe completar tanto "Unidades / Bultos" como "Unidades Sueltas" (o justificar como No contado) en todos los artículos.'
         );
       }
 
-      // If neither column has a value yet, preserve observations only in draft mode
       if (parsedBulk === null || parsedLoose === null) {
         if (isRecount) {
           db.prepare(
             `UPDATE count_items SET
+              is_not_counted = 0,
+              not_counted_reason = '',
               recount_bulk_qty = ?,
               recount_loose_qty = ?,
               recount_qty = NULL,
               counter_observations = COALESCE(NULLIF(?, ''), counter_observations),
               updated_at = datetime('now')
              WHERE id = ?`
-          ).run(parsedBulk, parsedLoose, entry.observations || '', existing.id);
+          ).run(parsedBulk, parsedLoose, obsText, existing.id);
         } else {
           db.prepare(
             `UPDATE count_items SET
+              is_not_counted = 0,
+              not_counted_reason = '',
               bulk_qty = ?,
               loose_qty = ?,
               counted_qty = NULL,
@@ -1725,7 +3079,7 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
               counter_observations = ?,
               updated_at = datetime('now')
              WHERE id = ?`
-          ).run(parsedBulk, parsedLoose, entry.observations || '', existing.id);
+          ).run(parsedBulk, parsedLoose, obsText, existing.id);
         }
         continue;
       }
@@ -1748,6 +3102,8 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
       if (isRecount) {
         db.prepare(
           `UPDATE count_items SET
+            is_not_counted = 0,
+            not_counted_reason = '',
             recount_bulk_qty = ?,
             recount_loose_qty = ?,
             recount_qty = ?,
@@ -1758,10 +3114,12 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
             historical_alert_text = ?,
             updated_at = datetime('now')
            WHERE id = ?`
-        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, entry.observations || '', histAlert, existing.id);
+        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
       } else {
         db.prepare(
           `UPDATE count_items SET
+            is_not_counted = 0,
+            not_counted_reason = '',
             bulk_qty = ?,
             loose_qty = ?,
             counted_qty = ?,
@@ -1772,7 +3130,7 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
             historical_alert_text = ?,
             updated_at = datetime('now')
            WHERE id = ?`
-        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, entry.observations || '', histAlert, existing.id);
+        ).run(parsedBulk, parsedLoose, qty, qty, diff, recResult, obsText, histAlert, existing.id);
       }
 
       if (submitForReview) {
@@ -1783,74 +3141,271 @@ app.post('/api/counts/:id/submit-results', requireAuth, (req: AuthenticatedReque
     }
 
     if (submitForReview) {
-      const missingSql = isRecount
-        ? 'SELECT COUNT(*) as cnt FROM count_items WHERE count_id = ? AND (recount_bulk_qty IS NULL OR recount_loose_qty IS NULL OR final_counted_qty IS NULL)'
-        : 'SELECT COUNT(*) as cnt FROM count_items WHERE count_id = ? AND (bulk_qty IS NULL OR loose_qty IS NULL OR final_counted_qty IS NULL)';
-      const missing = (db.prepare(missingSql).get(countId) as { cnt: number }).cnt;
+      // 1. All items must either have complete bulk+loose OR justified not-counted
+      const allCountItems = db
+        .prepare(
+          `SELECT ci.*, p.sku, p.description
+           FROM count_items ci
+           JOIN products p ON p.id = ci.product_id
+           WHERE ci.count_id = ?
+           ORDER BY p.description ASC`
+        )
+        .all(countId) as Array<Record<string, unknown>>;
 
-      if (missing > 0) {
+      const missingItems: string[] = [];
+      for (const it of allCountItems) {
+        const isUncounted = Number(it.is_not_counted || 0) === 1;
+        if (isUncounted) {
+          if (!String(it.not_counted_reason || '').trim()) {
+            missingItems.push(`${it.sku} (falta justificación de no conteo)`);
+          }
+          continue;
+        }
+        const hasValues = isRecount
+          ? it.recount_bulk_qty !== null &&
+            it.recount_loose_qty !== null &&
+            it.final_counted_qty !== null
+          : it.bulk_qty !== null && it.loose_qty !== null && it.final_counted_qty !== null;
+        if (!hasValues) {
+          missingItems.push(String(it.sku));
+        }
+      }
+
+      if (missingItems.length > 0) {
         throw new Error(
-          `Validación requerida: faltan completar Unidades / Bultos y/o Unidades Sueltas en ${missing} artículo(s) antes de enviar a revisión.`
+          `Condición de presentación incumplida: faltan completar resultados o justificación de no conteo en ${missingItems.length} artículo(s) (${missingItems.slice(0, 4).join(', ')}).`
         );
       }
 
+      // 2. Counter digital signature required
+      if (!counterSigTrimmed) {
+        throw new Error(
+          'Condición de presentación incumplida: debe registrar la firma o responsabilidad digital del contador.'
+        );
+      }
+
+      // 3. Warehouse manager signature required
+      const whSigCurrent = String(countRow.warehouse_signature_name || '').trim();
+      if (!whSigCurrent) {
+        throw new Error(
+          'Condición de presentación incumplida: falta la firma o confirmación del Responsable de Depósito.'
+        );
+      }
+
+      // 4. Mandatory general count observations
+      if (!generalObsTrimmed) {
+        throw new Error(
+          'Condición de presentación incumplida: debe completar las observaciones generales obligatorias del conteo.'
+        );
+      }
+
+      // 5. Required supporting attachment uploaded
+      const evidenceCount = getDocumentaryEvidenceCountForCount(countId);
+      if (evidenceCount === 0) {
+        throw new Error(
+          'Condición de presentación incumplida: debe cargar al menos un archivo adjunto respaldatorio (planilla firmada o foto de ítem) antes de presentar el conteo.'
+        );
+      }
+
+      const maxVerRow = db
+        .prepare('SELECT COALESCE(MAX(version_number), 0) as max_ver FROM count_submissions WHERE count_id = ?')
+        .get(countId) as { max_ver: number };
+      const nextVer = Number(maxVerRow.max_ver || 0) + 1;
+
+      const snapshotItems = allCountItems.map((it) => ({
+        item_id: it.id,
+        product_id: it.product_id,
+        sku: it.sku,
+        description: it.description,
+        snapshot_erp_stock: it.snapshot_erp_stock,
+        snapshot_committed_stock: it.snapshot_committed_stock,
+        bulk_qty: isRecount ? it.recount_bulk_qty : it.bulk_qty,
+        loose_qty: isRecount ? it.recount_loose_qty : it.loose_qty,
+        final_counted_qty: it.final_counted_qty,
+        is_not_counted: Number(it.is_not_counted || 0),
+        not_counted_reason: it.not_counted_reason || '',
+        difference: it.difference,
+        reconciliation_result: it.reconciliation_result,
+        counter_observations: it.counter_observations || '',
+      }));
+
+      db.prepare(
+        `INSERT INTO count_submissions (
+          count_id, version_number, submitted_by_user_id, submitted_by_username,
+          counter_signature_name, warehouse_signature_name, general_observations,
+          items_snapshot_json, outcome_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE_APROBACION')`
+      ).run(
+        countId,
+        nextVer,
+        req.user!.id,
+        req.user!.username,
+        counterSigTrimmed,
+        whSigCurrent,
+        generalObsTrimmed,
+        JSON.stringify(snapshotItems)
+      );
+
       db.prepare(
         `UPDATE counts SET
-          status = 'ENVIADO_REVISION',
+          status = 'PENDIENTE_APROBACION',
           submitted_at = datetime('now'),
+          submitted_by_user_id = ?,
           counter_signature_name = ?,
-          counter_signed_at = datetime('now')
+          counter_signed_at = datetime('now'),
+          counter_general_notes = ?,
+          updated_at = datetime('now')
          WHERE id = ?`
-      ).run(counterSignatureName?.trim() || req.user!.fullName, countId);
+      ).run(req.user!.id, counterSigTrimmed, generalObsTrimmed, countId);
 
-      const discrepancies = (
-        db
-          .prepare(
-            "SELECT COUNT(*) as cnt FROM count_items WHERE count_id = ? AND reconciliation_result IN ('FALTANTE', 'SOBRANTE')"
-          )
-          .get(countId) as { cnt: number }
-      ).cnt;
+      recordCountStateTransition({
+        countId,
+        locationId: Number(countRow.location_id),
+        previousStatus: prevStatus,
+        newStatus: CountStatus.PENDIENTE_APROBACION,
+        user: req.user!,
+        reason: `Conteo presentado para revisión (Versión v${nextVer}). Observaciones: ${generalObsTrimmed}`,
+        metadata: { versionNumber: nextVer, attachmentsCount: evidenceCount },
+        ipAddress: getClientIp(req),
+      });
+
+      const discrepancies = allCountItems.filter(
+        (it) =>
+          it.reconciliation_result === ReconciliationResult.FALTANTE ||
+          it.reconciliation_result === ReconciliationResult.SOBRANTE ||
+          Number(it.is_not_counted || 0) === 1
+      ).length;
 
       createNotification({
         targetRole: UserRole.JEFE_STOCK,
         severity: discrepancies > 0 ? 'ALTA' : 'INFO',
-        title: `Conteo ${countRow.count_number} listo para validación`,
-        message: `Enviado por ${req.user!.fullName}. Se detectaron ${discrepancies} diferencia(s) en la conciliación automática.`,
+        title: `Conteo ${countRow.count_number} pendiente de aprobación (v${nextVer})`,
+        message: `Presentado por ${req.user!.fullName}. Se detectaron ${discrepancies} novedad(es) o diferencia(s) para auditar.`,
         entityType: 'COUNT',
         entityId: countId,
       });
+
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'COUNT_PRESENTED_FOR_APPROVAL',
+        entityType: 'COUNT',
+        entityId: countId,
+        locationId: Number(countRow.location_id),
+        newValue: { versionNumber: nextVer, itemsCount: allCountItems.length, discrepancies },
+        ipAddress: getClientIp(req),
+      });
     } else {
-      db.prepare("UPDATE counts SET status = 'EN_PROGRESO' WHERE id = ? AND status = 'PROGRAMADO'").run(
+      db.prepare(
+        `UPDATE counts SET
+          status = CASE WHEN status IN ('ASIGNADO', 'RECHAZADO') THEN 'EN_EJECUCION' ELSE status END,
+          executed_at = COALESCE(executed_at, datetime('now')),
+          started_by_user_id = COALESCE(started_by_user_id, ?),
+          counter_signature_name = CASE WHEN ? != '' THEN ? ELSE counter_signature_name END,
+          counter_general_notes = CASE WHEN ? THEN ? ELSE counter_general_notes END,
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        req.user!.id,
+        counterSigTrimmed,
+        counterSigTrimmed,
+        body.generalObservations !== undefined ? 1 : 0,
+        generalObsTrimmed,
         countId
       );
-    }
 
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: submitForReview ? 'COUNT_SUBMITTED_FOR_REVIEW' : 'COUNT_DRAFT_SAVED',
-      entityType: 'COUNT',
-      entityId: countId,
-      locationId: Number(countRow.location_id),
-      newValue: { itemsUpdated: items.length, isRecount, submitForReview },
-      ipAddress: getClientIp(req),
-    });
+      if (prevStatus === CountStatus.ASIGNADO || prevStatus === CountStatus.RECHAZADO) {
+        recordCountStateTransition({
+          countId,
+          locationId: Number(countRow.location_id),
+          previousStatus: prevStatus,
+          newStatus: CountStatus.EN_EJECUCION,
+          user: req.user!,
+          reason: 'Borrador guardado durante relevamiento físico.',
+          ipAddress: getClientIp(req),
+        });
+      }
+
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'COUNT_DRAFT_SAVED',
+        entityType: 'COUNT',
+        entityId: countId,
+        locationId: Number(countRow.location_id),
+        newValue: { itemsUpdated: items.length, isRecount },
+        ipAddress: getClientIp(req),
+      });
+    }
   });
 
   try {
     tx();
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      status: submitForReview ? CountStatus.PENDIENTE_APROBACION : CountStatus.EN_EJECUCION,
+    });
   } catch (err: unknown) {
     res.status(400).json({ error: (err as Error).message });
   }
-});
+}
+
+app.post(
+  '/api/counts/:id/submit-results',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
+  (req: AuthenticatedRequest, res) => {
+    handleCountResultsOrPresentation(req, res, false);
+  }
+);
+
+app.post(
+  '/api/counts/:id/present',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
+  (req: AuthenticatedRequest, res) => {
+    handleCountResultsOrPresentation(req, res, true);
+  }
+);
 
 app.post(
   '/api/counts/:id/import-results-excel',
   requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.CONTADOR),
   memoryUpload.single('file'),
   (req: AuthenticatedRequest, res) => {
-    const countId = Number(req.params.id);
+    const countId = parsePositiveInt(req.params.id);
+    if (!countId) {
+      res.status(400).json({ error: 'Identificador de conteo inválido.' });
+      return;
+    }
+
+    const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+      | Record<string, unknown>
+      | undefined;
+    if (!countRow) {
+      res.status(404).json({ error: 'Conteo no encontrado.' });
+      return;
+    }
+    if (countRow.status === CountStatus.CERRADO) {
+      res.status(403).json({ error: 'El conteo está cerrado y no admite importación.' });
+      return;
+    }
+    if (req.user!.role === UserRole.RESPONSABLE_DEPOSITO) {
+      res.status(403).json({ error: 'El responsable de depósito no puede cargar resultados de conteo.' });
+      return;
+    }
+    if (
+      req.user!.role === UserRole.CONTADOR &&
+      (Number(countRow.assigned_counter_id) !== req.user!.id ||
+        !(
+          [CountStatus.ASIGNADO, CountStatus.EN_EJECUCION, CountStatus.RECHAZADO] as CountStatus[]
+        ).includes(countRow.status as CountStatus))
+    ) {
+      res.status(403).json({ error: 'No tiene permisos para importar resultados en este conteo.' });
+      return;
+    }
+
     if (!req.file) {
       res.status(400).json({ error: 'Adjunte el archivo Excel o CSV con los resultados.' });
       return;
@@ -1928,8 +3483,16 @@ app.post(
   }
 );
 
-app.post('/api/counts/:id/warehouse-sign', requireAuth, (req: AuthenticatedRequest, res) => {
-  const countId = Number(req.params.id);
+app.post(
+  '/api/counts/:id/warehouse-sign',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
   const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
     | Record<string, unknown>
     | undefined;
@@ -1948,7 +3511,7 @@ app.post('/api/counts/:id/warehouse-sign', requireAuth, (req: AuthenticatedReque
   }
 
   if (countRow.status === CountStatus.CERRADO) {
-    res.status(403).json({ error: 'El conteo ya fue cerrado.' });
+    res.status(403).json({ error: 'El conteo ya fue cerrado y no admite modificaciones.' });
     return;
   }
 
@@ -1957,7 +3520,8 @@ app.post('/api/counts/:id/warehouse-sign', requireAuth, (req: AuthenticatedReque
     `UPDATE counts SET
       warehouse_signature_name = ?,
       warehouse_signed_at = datetime('now'),
-      warehouse_confirmed_notes = ?
+      warehouse_confirmed_notes = ?,
+      updated_at = datetime('now')
      WHERE id = ?`
   ).run(signatureName?.trim() || req.user!.fullName, (notes || '').trim(), countId);
 
@@ -1975,76 +3539,284 @@ app.post('/api/counts/:id/warehouse-sign', requireAuth, (req: AuthenticatedReque
   res.json({ ok: true });
 });
 
+function executeRejectCount(
+  req: AuthenticatedRequest,
+  res: express.Response
+): void {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
+  const { rejectionReason, itemReasons, chiefObservations } = req.body as {
+    rejectionReason?: string;
+    itemReasons?: Array<{ itemId: number; reason: string }>;
+    chiefObservations?: string;
+  };
+
+  const finalReason = (rejectionReason || chiefObservations || '').trim();
+  if (!finalReason) {
+    res.status(400).json({
+      error: 'El motivo del rechazo es obligatorio para devolver el conteo al responsable asignado.',
+    });
+    return;
+  }
+
+  const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!countRow) {
+    res.status(404).json({ error: 'Conteo no encontrado.' });
+    return;
+  }
+  if (countRow.status === CountStatus.CERRADO) {
+    res.status(403).json({ error: 'No se puede rechazar un conteo ya cerrado.' });
+    return;
+  }
+  if (countRow.status !== CountStatus.PENDIENTE_APROBACION) {
+    res.status(400).json({
+      error: `Solo se puede rechazar un conteo en estado PENDIENTE DE APROBACIÓN (estado actual: ${countRow.status}).`,
+    });
+    return;
+  }
+
+  const tx = db.transaction(() => {
+    // Mark latest pending submission as RECHAZADO (preserving original submitted version)
+    const latestSub = db
+      .prepare(
+        `SELECT id FROM count_submissions
+         WHERE count_id = ? AND outcome_status = 'PENDIENTE_APROBACION'
+         ORDER BY version_number DESC LIMIT 1`
+      )
+      .get(countId) as { id: number } | undefined;
+    if (latestSub) {
+      db.prepare(
+        `UPDATE count_submissions SET
+          outcome_status = 'RECHAZADO',
+          reviewed_by_user_id = ?,
+          reviewed_by_username = ?,
+          review_notes = ?,
+          reviewed_at = datetime('now')
+         WHERE id = ?`
+      ).run(req.user!.id, req.user!.username, finalReason, latestSub.id);
+    }
+
+    db.prepare(
+      `UPDATE counts SET
+        status = 'RECHAZADO',
+        rejected_at = datetime('now'),
+        rejected_by_user_id = ?,
+        rejection_reason = ?,
+        chief_notes = ?,
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(req.user!.id, finalReason, finalReason, countId);
+
+    if (Array.isArray(itemReasons)) {
+      const upd = db.prepare(
+        'UPDATE count_items SET recount_requested_reason = ? WHERE id = ? AND count_id = ?'
+      );
+      for (const r of itemReasons) {
+        upd.run(String(r.reason || '').trim(), r.itemId, countId);
+      }
+    }
+
+    recordCountStateTransition({
+      countId,
+      locationId: Number(countRow.location_id),
+      previousStatus: String(countRow.status),
+      newStatus: CountStatus.RECHAZADO,
+      user: req.user!,
+      reason: finalReason,
+      metadata: { itemReasonsCount: Array.isArray(itemReasons) ? itemReasons.length : 0 },
+      ipAddress: getClientIp(req),
+    });
+
+    if (countRow.assigned_counter_id) {
+      createNotification({
+        targetUserId: Number(countRow.assigned_counter_id),
+        severity: 'ALTA',
+        title: `Conteo rechazado: ${countRow.count_number}`,
+        message: `Motivo: ${finalReason}`,
+        entityType: 'COUNT',
+        entityId: countId,
+      });
+    }
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'COUNT_REJECTED',
+      entityType: 'COUNT',
+      entityId: countId,
+      locationId: Number(countRow.location_id),
+      newValue: { rejectionReason: finalReason, itemReasons },
+      ipAddress: getClientIp(req),
+    });
+  });
+
+  tx();
+  res.json({ ok: true, status: CountStatus.RECHAZADO });
+}
+
+app.post(
+  '/api/counts/:id/reject',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  executeRejectCount
+);
+
 app.post(
   '/api/counts/:id/request-recount',
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
-  (req: AuthenticatedRequest, res) => {
-    const countId = Number(req.params.id);
-    const { itemReasons, chiefObservations } = req.body as {
-      itemReasons?: Array<{ itemId: number; reason: string }>;
-      chiefObservations?: string;
-    };
+  executeRejectCount
+);
 
-    const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
-      | Record<string, unknown>
-      | undefined;
-    if (!countRow) {
-      res.status(404).json({ error: 'Conteo no encontrado.' });
-      return;
-    }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(403).json({ error: 'No se puede solicitar reconteo sobre un conteo cerrado.' });
-      return;
-    }
+function executeApproveCount(
+  req: AuthenticatedRequest,
+  res: express.Response
+): void {
+  const countId = parsePositiveInt(req.params.id);
+  if (!countId) {
+    res.status(400).json({ error: 'Identificador de conteo inválido.' });
+    return;
+  }
+  const { approvalNotes, chiefNotes } = req.body as {
+    approvalNotes?: string;
+    chiefNotes?: string;
+  };
+  const notesText = (approvalNotes ?? chiefNotes ?? '').trim();
 
-    const tx = db.transaction(() => {
+  const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!countRow) {
+    res.status(404).json({ error: 'Conteo no encontrado.' });
+    return;
+  }
+  if (countRow.status === CountStatus.CERRADO) {
+    res.status(403).json({ error: 'El conteo ya está cerrado.' });
+    return;
+  }
+  if (countRow.status !== CountStatus.PENDIENTE_APROBACION) {
+    res.status(400).json({
+      error: `No se puede aprobar el conteo desde el estado ${countRow.status}. Debe encontrarse en PENDIENTE DE APROBACIÓN.`,
+    });
+    return;
+  }
+
+  const itemProdRows = db
+    .prepare('SELECT product_id FROM count_items WHERE count_id = ?')
+    .all(countId) as Array<{ product_id: number }>;
+  const postMovements = getPostSnapshotMovementsForCount(
+    countId,
+    Number(countRow.location_id),
+    String(countRow.created_at),
+    itemProdRows.map((r) => r.product_id)
+  );
+
+  const tx = db.transaction(() => {
+    const latestSub = db
+      .prepare(
+        `SELECT id FROM count_submissions
+         WHERE count_id = ? AND outcome_status = 'PENDIENTE_APROBACION'
+         ORDER BY version_number DESC LIMIT 1`
+      )
+      .get(countId) as { id: number } | undefined;
+    if (latestSub) {
       db.prepare(
-        "UPDATE counts SET status = 'RECONTEO_SOLICITADO', chief_notes = ? WHERE id = ?"
-      ).run(chiefObservations || '', countId);
+        `UPDATE count_submissions SET
+          outcome_status = 'APROBADO',
+          reviewed_by_user_id = ?,
+          reviewed_by_username = ?,
+          review_notes = ?,
+          reviewed_at = datetime('now')
+         WHERE id = ?`
+      ).run(req.user!.id, req.user!.username, notesText, latestSub.id);
+    }
 
-      if (Array.isArray(itemReasons)) {
-        const upd = db.prepare(
-          'UPDATE count_items SET recount_requested_reason = ? WHERE id = ? AND count_id = ?'
-        );
-        for (const r of itemReasons) {
-          upd.run(r.reason, r.itemId, countId);
-        }
-      }
+    db.prepare(
+      `UPDATE counts SET
+        status = 'APROBADO',
+        approved_at = datetime('now'),
+        approved_by_user_id = ?,
+        approval_notes = ?,
+        validated_at = datetime('now'),
+        chief_notes = ?,
+        has_post_snapshot_movements = ?,
+        updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(
+      req.user!.id,
+      notesText,
+      notesText,
+      postMovements.length > 0 ? 1 : 0,
+      countId
+    );
 
-      createNotification({
-        targetUserId: Number(countRow.assigned_counter_id),
-        severity: 'ALTA',
-        title: `Reconteo solicitado: ${countRow.count_number}`,
-        message: chiefObservations || 'El Jefe de Control de Stock solicitó una segunda verificación física.',
-        entityType: 'COUNT',
-        entityId: countId,
-      });
-
-      logAudit({
-        userId: req.user!.id,
-        username: req.user!.username,
-        action: 'RECOUNT_REQUESTED',
-        entityType: 'COUNT',
-        entityId: countId,
-        locationId: Number(countRow.location_id),
-        newValue: { chiefObservations, itemReasons },
-        ipAddress: getClientIp(req),
-      });
+    recordCountStateTransition({
+      countId,
+      locationId: Number(countRow.location_id),
+      previousStatus: String(countRow.status),
+      newStatus: CountStatus.APROBADO,
+      user: req.user!,
+      reason: notesText || 'Resultado físico aprobado por el Jefe de Control de Stock (stock ERP intacto).',
+      metadata: { postSnapshotMovementsCount: postMovements.length },
+      ipAddress: getClientIp(req),
     });
 
-    tx();
-    res.json({ ok: true });
-  }
+    if (countRow.assigned_counter_id) {
+      createNotification({
+        targetUserId: Number(countRow.assigned_counter_id),
+        severity: 'INFO',
+        title: `Conteo aprobado: ${countRow.count_number}`,
+        message: 'El Jefe de Control de Stock aprobó el relevamiento físico presentado.',
+        entityType: 'COUNT',
+        entityId: countId,
+      });
+    }
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'COUNT_APPROVED',
+      entityType: 'COUNT',
+      entityId: countId,
+      locationId: Number(countRow.location_id),
+      newValue: { approvalNotes: notesText, postSnapshotMovementsCount: postMovements.length },
+      ipAddress: getClientIp(req),
+    });
+  });
+
+  tx();
+  res.json({ ok: true, status: CountStatus.APROBADO });
+}
+
+app.post(
+  '/api/counts/:id/approve',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  executeApproveCount
 );
 
 app.post(
   '/api/counts/:id/validate',
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
+  executeApproveCount
+);
+
+app.post(
+  '/api/counts/:id/start-regularization',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
   (req: AuthenticatedRequest, res) => {
-    const countId = Number(req.params.id);
-    const { chiefNotes } = req.body as { chiefNotes?: string };
+    const countId = parsePositiveInt(req.params.id);
+    if (!countId) {
+      res.status(400).json({ error: 'Identificador de conteo inválido.' });
+      return;
+    }
     const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
       | Record<string, unknown>
       | undefined;
@@ -2052,27 +3824,31 @@ app.post(
       res.status(404).json({ error: 'Conteo no encontrado.' });
       return;
     }
-    if (countRow.status === CountStatus.CERRADO) {
-      res.status(403).json({ error: 'El conteo ya está cerrado.' });
+    if (countRow.status !== CountStatus.APROBADO) {
+      res.status(400).json({
+        error: `Solo un conteo APROBADO puede pasar a PENDIENTE DE REGULARIZACIÓN (estado actual: ${countRow.status}).`,
+      });
       return;
     }
 
-    db.prepare(
-      "UPDATE counts SET status = 'VALIDADO', validated_at = datetime('now'), chief_notes = ? WHERE id = ?"
-    ).run(chiefNotes || '', countId);
+    const tx = db.transaction(() => {
+      db.prepare(
+        "UPDATE counts SET status = 'PENDIENTE_REGULARIZACION', updated_at = datetime('now') WHERE id = ?"
+      ).run(countId);
 
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: 'COUNT_VALIDATED',
-      entityType: 'COUNT',
-      entityId: countId,
-      locationId: Number(countRow.location_id),
-      newValue: { chiefNotes },
-      ipAddress: getClientIp(req),
+      recordCountStateTransition({
+        countId,
+        locationId: Number(countRow.location_id),
+        previousStatus: String(countRow.status),
+        newStatus: CountStatus.PENDIENTE_REGULARIZACION,
+        user: req.user!,
+        reason: 'Circuito de regularización y documentación de ajustes habilitado.',
+        ipAddress: getClientIp(req),
+      });
     });
 
-    res.json({ ok: true });
+    tx();
+    res.json({ ok: true, status: CountStatus.PENDIENTE_REGULARIZACION });
   }
 );
 
@@ -2081,8 +3857,12 @@ app.post(
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
   (req: AuthenticatedRequest, res) => {
-    const countId = Number(req.params.id);
-    const itemId = Number(req.params.itemId);
+    const countId = parsePositiveInt(req.params.id);
+    const itemId = parsePositiveInt(req.params.itemId);
+    if (!countId || !itemId) {
+      res.status(400).json({ error: 'Identificadores inválidos.' });
+      return;
+    }
     const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
       | Record<string, unknown>
       | undefined;
@@ -2092,6 +3872,15 @@ app.post(
     }
     if (countRow.status === CountStatus.CERRADO) {
       res.status(403).json({ error: 'No se pueden modificar regularizaciones de un conteo cerrado.' });
+      return;
+    }
+    if (
+      countRow.status !== CountStatus.APROBADO &&
+      countRow.status !== CountStatus.PENDIENTE_REGULARIZACION
+    ) {
+      res.status(400).json({
+        error: `No se pueden registrar regularizaciones en estado ${countRow.status}. Primero debe aprobar el conteo.`,
+      });
       return;
     }
 
@@ -2117,8 +3906,12 @@ app.post(
       adjustmentNotes?: string;
     };
 
-    if (!adjustmentStatus || !Object.values(AdjustmentOperationType).includes(adjustmentStatus)) {
-      res.status(400).json({ error: 'Tipo de operación inválido.' });
+    if (
+      !adjustmentStatus ||
+      !Object.values(AdjustmentOperationType).includes(adjustmentStatus) ||
+      adjustmentStatus === AdjustmentOperationType.PENDIENTE
+    ) {
+      res.status(400).json({ error: 'Tipo de operación de regularización inválido.' });
       return;
     }
 
@@ -2143,42 +3936,63 @@ app.post(
       return;
     }
 
-    db.prepare(
-      `UPDATE count_items SET
-        adjustment_status = ?,
-        erp_operation_number = ?,
-        regularization_date = ?,
-        regularized_by_user_id = ?,
-        no_adjustment_reason = ?,
-        adjustment_notes = ?,
-        updated_at = datetime('now')
-       WHERE id = ?`
-    ).run(
-      adjustmentStatus,
-      (erpOperationNumber || '').trim(),
-      regularizationDate || new Date().toISOString().slice(0, 10),
-      req.user!.id,
-      (noAdjustmentReason || '').trim(),
-      (adjustmentNotes || '').trim(),
-      itemId
-    );
+    const regTx = db.transaction(() => {
+      if (countRow.status === CountStatus.APROBADO) {
+        db.prepare(
+          "UPDATE counts SET status = 'PENDIENTE_REGULARIZACION', updated_at = datetime('now') WHERE id = ?"
+        ).run(countId);
 
-    logAudit({
-      userId: req.user!.id,
-      username: req.user!.username,
-      action: 'COUNT_ITEM_REGULARIZED',
-      entityType: 'COUNT_ITEM',
-      entityId: itemId,
-      locationId: Number(countRow.location_id),
-      oldValue: {
-        adjustmentStatus: itemRow.adjustment_status,
-        erpOperationNumber: itemRow.erp_operation_number,
-      },
-      newValue: { adjustmentStatus, erpOperationNumber, noAdjustmentReason, adjustmentNotes },
-      ipAddress: getClientIp(req),
+        recordCountStateTransition({
+          countId,
+          locationId: Number(countRow.location_id),
+          previousStatus: CountStatus.APROBADO,
+          newStatus: CountStatus.PENDIENTE_REGULARIZACION,
+          user: req.user!,
+          reason: 'Transición automática a regularización al documentar primera novedad.',
+          ipAddress: getClientIp(req),
+        });
+      } else {
+        db.prepare("UPDATE counts SET updated_at = datetime('now') WHERE id = ?").run(countId);
+      }
+
+      db.prepare(
+        `UPDATE count_items SET
+          adjustment_status = ?,
+          erp_operation_number = ?,
+          regularization_date = ?,
+          regularized_by_user_id = ?,
+          no_adjustment_reason = ?,
+          adjustment_notes = ?,
+          updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(
+        adjustmentStatus,
+        (erpOperationNumber || '').trim(),
+        regularizationDate || new Date().toISOString().slice(0, 10),
+        req.user!.id,
+        (noAdjustmentReason || '').trim(),
+        (adjustmentNotes || '').trim(),
+        itemId
+      );
+
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'COUNT_ITEM_REGULARIZED',
+        entityType: 'COUNT_ITEM',
+        entityId: itemId,
+        locationId: Number(countRow.location_id),
+        oldValue: {
+          adjustmentStatus: itemRow.adjustment_status,
+          erpOperationNumber: itemRow.erp_operation_number,
+        },
+        newValue: { adjustmentStatus, erpOperationNumber, noAdjustmentReason, adjustmentNotes },
+        ipAddress: getClientIp(req),
+      });
     });
 
-    res.json({ ok: true });
+    regTx();
+    res.json({ ok: true, status: CountStatus.PENDIENTE_REGULARIZACION });
   }
 );
 
@@ -2187,7 +4001,11 @@ app.post(
   requireAuth,
   requireRole(UserRole.JEFE_STOCK),
   (req: AuthenticatedRequest, res) => {
-    const countId = Number(req.params.id);
+    const countId = parsePositiveInt(req.params.id);
+    if (!countId) {
+      res.status(400).json({ error: 'Identificador de conteo inválido.' });
+      return;
+    }
     const { chiefSignatureName } = req.body as { chiefSignatureName?: string };
 
     const countRow = db.prepare('SELECT * FROM counts WHERE id = ?').get(countId) as
@@ -2198,12 +4016,15 @@ app.post(
       return;
     }
     if (countRow.status === CountStatus.CERRADO) {
-      res.status(400).json({ error: 'El conteo ya se encuentra cerrado.' });
+      res.status(400).json({ error: 'El conteo ya se encuentra cerrado y finalizado.' });
       return;
     }
-    if (countRow.status !== CountStatus.VALIDADO) {
+    if (
+      countRow.status !== CountStatus.APROBADO &&
+      countRow.status !== CountStatus.PENDIENTE_REGULARIZACION
+    ) {
       res.status(400).json({
-        error: 'Condición de cierre incumplida: el conteo debe ser VALIDADO por el Jefe antes del cierre.',
+        error: `Condición de cierre incumplida: no se pueden saltar etapas. El conteo debe haber sido APROBADO antes del cierre (estado actual: ${countRow.status}).`,
       });
       return;
     }
@@ -2219,16 +4040,20 @@ app.post(
       .all(countId) as Array<Record<string, unknown>>;
 
     for (const it of items) {
-      if (it.final_counted_qty === null || it.reconciliation_result === null) {
+      const isNotCounted = Number(it.is_not_counted || 0) === 1;
+      if (!isNotCounted && (it.final_counted_qty === null || it.reconciliation_result === null)) {
         res.status(400).json({
-          error: 'Condición de cierre incumplida: todos los artículos deben tener resultado físico y conciliación.',
+          error: 'Condición de cierre incumplida: todos los artículos deben tener resultado físico o justificación de no conteo.',
         });
         return;
       }
-      if (it.reconciliation_result !== ReconciliationResult.COINCIDENCIA) {
+      const needsRegularization =
+        isNotCounted || it.reconciliation_result !== ReconciliationResult.COINCIDENCIA;
+      if (needsRegularization) {
         if (it.adjustment_status === AdjustmentOperationType.PENDIENTE) {
           res.status(400).json({
-            error: 'Condición de cierre incumplida: existen diferencias sin regularizar ni justificar como "Sin ajuste".',
+            error:
+              'Condición de cierre incumplida: existen diferencias o ítems no contados sin regularizar ni justificar como "Sin ajuste".',
           });
           return;
         }
@@ -2242,12 +4067,39 @@ app.post(
           });
           return;
         }
+        if (
+          it.adjustment_status === AdjustmentOperationType.SIN_AJUSTE &&
+          !String(it.no_adjustment_reason || '').trim()
+        ) {
+          res.status(400).json({
+            error: 'Condición de cierre incumplida: falta la justificación expresa en una línea marcada como "Sin ajuste".',
+          });
+          return;
+        }
       }
     }
 
+    const attachmentsCount = getAttachmentsCountForCount(countId);
+    if (attachmentsCount === 0) {
+      res.status(400).json({
+        error:
+          'Condición de cierre incumplida: debe adjuntar al menos un documento respaldatorio (planilla firmada o comprobante ERP) antes del cierre definitivo.',
+      });
+      return;
+    }
+
+    const postMovements = getPostSnapshotMovementsForCount(
+      countId,
+      Number(countRow.location_id),
+      String(countRow.created_at),
+      items.map((it) => Number(it.product_id))
+    );
+
+    const prevStatus = String(countRow.status);
     const closeTx = db.transaction(() => {
       for (const it of items) {
         if (
+          Number(it.is_not_counted || 0) === 0 &&
           it.reconciliation_result !== ReconciliationResult.COINCIDENCIA &&
           (it.adjustment_status === AdjustmentOperationType.AJUSTE ||
             it.adjustment_status === AdjustmentOperationType.MOVIMIENTO)
@@ -2285,10 +4137,24 @@ app.post(
         `UPDATE counts SET
           status = 'CERRADO',
           closed_at = datetime('now'),
+          closed_by_user_id = ?,
           chief_signature_name = ?,
-          chief_signed_at = datetime('now')
+          chief_signed_at = datetime('now'),
+          has_post_snapshot_movements = ?,
+          updated_at = datetime('now')
          WHERE id = ?`
-      ).run(chiefSignatureName.trim(), countId);
+      ).run(req.user!.id, chiefSignatureName.trim(), postMovements.length > 0 ? 1 : 0, countId);
+
+      recordCountStateTransition({
+        countId,
+        locationId: Number(countRow.location_id),
+        previousStatus: prevStatus,
+        newStatus: CountStatus.CERRADO,
+        user: req.user!,
+        reason: `Cierre y finalización definitiva del conteo con firma de ${chiefSignatureName.trim()}.`,
+        metadata: { attachmentsCount, hasPostSnapshotMovements: postMovements.length > 0 },
+        ipAddress: getClientIp(req),
+      });
 
       logAudit({
         userId: req.user!.id,
@@ -2297,19 +4163,119 @@ app.post(
         entityType: 'COUNT',
         entityId: countId,
         locationId: Number(countRow.location_id),
-        newValue: { chiefSignatureName: chiefSignatureName.trim(), itemsCount: items.length },
+        newValue: {
+          chiefSignatureName: chiefSignatureName.trim(),
+          itemsCount: items.length,
+          attachmentsCount,
+          hasPostSnapshotMovements: postMovements.length > 0,
+        },
         ipAddress: getClientIp(req),
       });
     });
 
     closeTx();
-    res.json({ ok: true });
+    res.json({ ok: true, status: CountStatus.CERRADO });
   }
 );
 
 // ============================================================================
 // 7. ATTACHMENTS (PHOTOS & ERP EVIDENCE DOCUMENTS)
 // ============================================================================
+
+function authorizeAttachmentEntity(
+  user: AuthUser,
+  entityType: string,
+  entityId: number,
+  mode: 'READ' | 'WRITE'
+): { ok: true; locationId: number | null } | { ok: false; status: number; error: string } {
+  if (mode === 'WRITE' && user.role === UserRole.AUDITORIA_DIRECCION) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'El perfil Dirección / Auditoría Interna es de solo lectura y no puede cargar adjuntos.',
+    };
+  }
+
+  if (entityType === 'COUNT_ITEM') {
+    const item = db
+      .prepare(
+        `SELECT ci.id, c.location_id, c.assigned_counter_id, c.status
+         FROM count_items ci
+         JOIN counts c ON c.id = ci.count_id
+         WHERE ci.id = ?`
+      )
+      .get(entityId) as
+      | { id: number; location_id: number; assigned_counter_id: number; status: string }
+      | undefined;
+    if (!item) return { ok: false, status: 404, error: 'Ítem de conteo no encontrado.' };
+    if (mode === 'WRITE' && item.status === CountStatus.CERRADO) {
+      return { ok: false, status: 403, error: 'El conteo está cerrado y no admite nuevos adjuntos.' };
+    }
+    if (user.role === UserRole.JEFE_STOCK) return { ok: true, locationId: item.location_id };
+    if (mode === 'READ' && user.role === UserRole.AUDITORIA_DIRECCION) {
+      return { ok: true, locationId: item.location_id };
+    }
+    if (user.role === UserRole.CONTADOR) {
+      if (item.assigned_counter_id !== user.id) {
+        return { ok: false, status: 403, error: 'Solo puede acceder a adjuntos de sus conteos asignados.' };
+      }
+      return { ok: true, locationId: item.location_id };
+    }
+    if (mode === 'READ' && userCanAccessLocation(user, item.location_id)) {
+      return { ok: true, locationId: item.location_id };
+    }
+    return { ok: false, status: 403, error: 'Permisos insuficientes sobre este adjunto de conteo.' };
+  }
+
+  if (entityType === 'COUNT_SHEET' || entityType === 'ADJUSTMENT') {
+    const count = db
+      .prepare('SELECT id, location_id, assigned_counter_id, status FROM counts WHERE id = ?')
+      .get(entityId) as
+      | { id: number; location_id: number; assigned_counter_id: number; status: string }
+      | undefined;
+    if (!count) return { ok: false, status: 404, error: 'Conteo no encontrado.' };
+    if (mode === 'WRITE' && count.status === CountStatus.CERRADO) {
+      return { ok: false, status: 403, error: 'El conteo está cerrado y no admite nuevos adjuntos.' };
+    }
+    if (user.role === UserRole.JEFE_STOCK) return { ok: true, locationId: count.location_id };
+    if (mode === 'READ' && user.role === UserRole.AUDITORIA_DIRECCION) {
+      return { ok: true, locationId: count.location_id };
+    }
+    if (entityType === 'ADJUSTMENT') {
+      if (mode === 'READ' && user.role === UserRole.RESPONSABLE_DEPOSITO && userCanAccessLocation(user, count.location_id)) {
+        return { ok: true, locationId: count.location_id };
+      }
+      return { ok: false, status: 403, error: 'Solo Control de Stock puede gestionar comprobantes ERP de ajuste.' };
+    }
+    // COUNT_SHEET
+    if (user.role === UserRole.CONTADOR) {
+      if (count.assigned_counter_id !== user.id) {
+        return { ok: false, status: 403, error: 'No tiene permisos sobre esta planilla de conteo.' };
+      }
+      return { ok: true, locationId: count.location_id };
+    }
+    if (userCanAccessLocation(user, count.location_id)) {
+      return { ok: true, locationId: count.location_id };
+    }
+    return { ok: false, status: 403, error: 'No tiene permisos sobre la ubicación de este conteo.' };
+  }
+
+  if (entityType === 'POS_OPERATION') {
+    if (user.role === UserRole.CONTADOR) {
+      return { ok: false, status: 403, error: 'Los contadores no acceden a documentación de Punto de Venta.' };
+    }
+    const op = db
+      .prepare('SELECT id, location_id FROM pos_operations WHERE id = ?')
+      .get(entityId) as { id: number; location_id: number } | undefined;
+    if (!op) return { ok: false, status: 404, error: 'Operación comercial no encontrada.' };
+    if (!userCanAccessLocation(user, op.location_id)) {
+      return { ok: false, status: 403, error: 'No tiene permisos sobre la ubicación de esta operación.' };
+    }
+    return { ok: true, locationId: op.location_id };
+  }
+
+  return { ok: false, status: 400, error: 'Tipo de entidad inválido.' };
+}
 
 app.post(
   '/api/attachments',
@@ -2322,12 +4288,21 @@ app.post(
     }
 
     const { entityType, entityId } = req.body as { entityType?: string; entityId?: string };
+    const parsedEntityId = parsePositiveInt(entityId);
     if (
       !entityType ||
       !['COUNT_ITEM', 'COUNT_SHEET', 'ADJUSTMENT', 'POS_OPERATION'].includes(entityType) ||
-      !entityId
+      !parsedEntityId
     ) {
+      fs.unlink(req.file.path, () => {});
       res.status(400).json({ error: 'Tipo y referencia de entidad requeridos.' });
+      return;
+    }
+
+    const authz = authorizeAttachmentEntity(req.user!, entityType, parsedEntityId, 'WRITE');
+    if (!authz.ok) {
+      fs.unlink(req.file.path, () => {});
+      res.status(authz.status).json({ error: authz.error });
       return;
     }
 
@@ -2338,7 +4313,7 @@ app.post(
       )
       .run(
         entityType,
-        Number(entityId),
+        parsedEntityId,
         req.file.filename,
         req.file.originalname,
         req.file.mimetype,
@@ -2351,7 +4326,8 @@ app.post(
       username: req.user!.username,
       action: 'ATTACHMENT_UPLOADED',
       entityType,
-      entityId: Number(entityId),
+      entityId: parsedEntityId,
+      locationId: authz.locationId,
       newValue: { originalName: req.file.originalname, sizeBytes: req.file.size },
       ipAddress: getClientIp(req),
     });
@@ -2364,13 +4340,31 @@ app.post(
   }
 );
 
-app.get('/api/attachments/:id', requireAuth, (req, res) => {
-  const attId = Number(req.params.id);
+app.get('/api/attachments/:id', requireAuth, (req: AuthenticatedRequest, res) => {
+  const attId = parsePositiveInt(req.params.id);
+  if (!attId) {
+    res.status(400).json({ error: 'Identificador de adjunto inválido.' });
+    return;
+  }
+
   const row = db.prepare('SELECT * FROM attachments WHERE id = ?').get(attId) as
-    | { filename: string; original_name: string; mime_type: string }
+    | {
+        id: number;
+        entity_type: string;
+        entity_id: number;
+        filename: string;
+        original_name: string;
+        mime_type: string;
+      }
     | undefined;
   if (!row) {
     res.status(404).json({ error: 'Archivo no encontrado.' });
+    return;
+  }
+
+  const authz = authorizeAttachmentEntity(req.user!, row.entity_type, Number(row.entity_id), 'READ');
+  if (!authz.ok) {
+    res.status(authz.status).json({ error: authz.error });
     return;
   }
 
@@ -2380,8 +4374,19 @@ app.get('/api/attachments/:id', requireAuth, (req, res) => {
     return;
   }
 
-  res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `inline; filename="${row.original_name.replace(/"/g, '')}"`);
+  const safeFilename = String(row.original_name || 'archivo').replace(/[\r\n"\\]/g, '_');
+  const safeInlineTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf']);
+  const isSafeInline = safeInlineTypes.has(row.mime_type);
+  const contentType = ALLOWED_ATTACHMENT_MIMES.has(row.mime_type)
+    ? row.mime_type
+    : 'application/octet-stream';
+
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Type', contentType);
+  res.setHeader(
+    'Content-Disposition',
+    `${isSafeInline ? 'inline' : 'attachment'}; filename="${safeFilename}"`
+  );
   fs.createReadStream(resolvedPath).pipe(res);
 });
 
@@ -2411,7 +4416,7 @@ app.get('/api/pos/catalog', requireAuth, (req: AuthenticatedRequest, res) => {
   if (locationId) {
     conds.push('ib.location_id = ?');
     params.push(locationId);
-  } else if (req.user!.role !== UserRole.JEFE_STOCK) {
+  } else if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
     if (req.user!.assignedLocationIds.length === 0) {
       res.json({ catalog: [] });
       return;
@@ -2450,13 +4455,18 @@ app.get('/api/pos/operations', requireAuth, (req: AuthenticatedRequest, res) => 
     res.status(403).json({ error: 'Acceso denegado.' });
     return;
   }
-  const locationId = req.query.locationId ? Number(req.query.locationId) : null;
+  const locationId = req.query.locationId ? parsePositiveInt(req.query.locationId) : null;
   const status = String(req.query.status || '').trim();
+
+  if (locationId && !userCanAccessLocation(req.user!, locationId)) {
+    res.status(403).json({ error: 'No tiene permisos sobre esta ubicación.' });
+    return;
+  }
 
   const conds: string[] = [];
   const params: unknown[] = [];
 
-  if (req.user!.role !== UserRole.JEFE_STOCK) {
+  if (req.user!.role !== UserRole.JEFE_STOCK && req.user!.role !== UserRole.AUDITORIA_DIRECCION) {
     if (req.user!.assignedLocationIds.length === 0) {
       res.json({ operations: [] });
       return;
@@ -2500,11 +4510,11 @@ app.get('/api/pos/operations', requireAuth, (req: AuthenticatedRequest, res) => 
   res.json({ operations: enriched });
 });
 
-app.post('/api/pos/operations', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.user!.role === UserRole.CONTADOR) {
-    res.status(403).json({ error: 'Los contadores no pueden registrar operaciones comerciales.' });
-    return;
-  }
+app.post(
+  '/api/pos/operations',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
 
   const { operationType, locationId, customerName, customerDoc, notes, items } = req.body as {
     operationType?: PosOperationType;
@@ -2668,18 +4678,26 @@ app.post('/api/pos/operations', requireAuth, (req: AuthenticatedRequest, res) =>
   }
 });
 
-app.post('/api/pos/operations/:id/confirm', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.user!.role === UserRole.CONTADOR) {
-    res.status(403).json({ error: 'Acceso denegado.' });
+app.post(
+  '/api/pos/operations/:id/confirm',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+
+  const opId = parsePositiveInt(req.params.id);
+  if (!opId) {
+    res.status(400).json({ error: 'Identificador de operación inválido.' });
     return;
   }
-
-  const opId = Number(req.params.id);
   const op = db.prepare('SELECT * FROM pos_operations WHERE id = ?').get(opId) as
     | Record<string, unknown>
     | undefined;
   if (!op) {
     res.status(404).json({ error: 'Operación no encontrada.' });
+    return;
+  }
+  if (!userCanAccessLocation(req.user!, Number(op.location_id))) {
+    res.status(403).json({ error: 'No tiene permisos para confirmar operaciones en esta ubicación.' });
     return;
   }
   if (op.status !== PosOperationStatus.PENDIENTE || op.operation_type !== PosOperationType.RESERVA) {
@@ -2736,13 +4754,17 @@ app.post('/api/pos/operations/:id/confirm', requireAuth, (req: AuthenticatedRequ
   res.json({ ok: true });
 });
 
-app.post('/api/pos/operations/:id/void', requireAuth, (req: AuthenticatedRequest, res) => {
-  if (req.user!.role === UserRole.CONTADOR) {
-    res.status(403).json({ error: 'Acceso denegado.' });
+app.post(
+  '/api/pos/operations/:id/void',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO),
+  (req: AuthenticatedRequest, res) => {
+
+  const opId = parsePositiveInt(req.params.id);
+  if (!opId) {
+    res.status(400).json({ error: 'Identificador de operación inválido.' });
     return;
   }
-
-  const opId = Number(req.params.id);
   const { reason } = req.body as { reason?: string };
   if (!reason || !reason.trim()) {
     res.status(400).json({ error: 'Debe especificar el motivo de anulación para mantener trazabilidad.' });
@@ -2754,6 +4776,10 @@ app.post('/api/pos/operations/:id/void', requireAuth, (req: AuthenticatedRequest
     | undefined;
   if (!op) {
     res.status(404).json({ error: 'Operación no encontrada.' });
+    return;
+  }
+  if (!userCanAccessLocation(req.user!, Number(op.location_id))) {
+    res.status(403).json({ error: 'No tiene permisos para anular operaciones en esta ubicación.' });
     return;
   }
   if (op.status === PosOperationStatus.ANULADA) {
@@ -2857,7 +4883,11 @@ app.get('/api/pos/export-erp', requireAuth, requireRole(UserRole.JEFE_STOCK), (_
 // 9. EXECUTIVE DASHBOARD, AI ANALYTICS, NOTIFICATIONS, AUDIT & BACKUP
 // ============================================================================
 
-app.get('/api/dashboard/executive', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: AuthenticatedRequest, res) => {
+app.get(
+  '/api/dashboard/executive',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION),
+  (req: AuthenticatedRequest, res) => {
   const dateFrom = String(req.query.dateFrom || '').trim();
   const dateTo = String(req.query.dateTo || '').trim();
   const locationId = req.query.locationId ? Number(req.query.locationId) : null;
@@ -2895,10 +4925,13 @@ app.get('/api/dashboard/executive', requireAuth, requireRole(UserRole.JEFE_STOCK
     .prepare(
       `SELECT
         COUNT(*) as total_counts,
-        SUM(CASE WHEN c.status = 'PROGRAMADO' THEN 1 ELSE 0 END) as programados,
-        SUM(CASE WHEN c.status = 'EN_PROGRESO' THEN 1 ELSE 0 END) as en_progreso,
-        SUM(CASE WHEN c.status IN ('ENVIADO_REVISION', 'RECONTEO_SOLICITADO') THEN 1 ELSE 0 END) as en_revision,
-        SUM(CASE WHEN c.status = 'VALIDADO' THEN 1 ELSE 0 END) as validados,
+        SUM(CASE WHEN c.status = 'BORRADOR' THEN 1 ELSE 0 END) as borradores,
+        SUM(CASE WHEN c.status = 'ASIGNADO' THEN 1 ELSE 0 END) as asignados,
+        SUM(CASE WHEN c.status = 'EN_EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
+        SUM(CASE WHEN c.status = 'PENDIENTE_APROBACION' THEN 1 ELSE 0 END) as pendientes_aprobacion,
+        SUM(CASE WHEN c.status = 'RECHAZADO' THEN 1 ELSE 0 END) as rechazados,
+        SUM(CASE WHEN c.status = 'APROBADO' THEN 1 ELSE 0 END) as aprobados,
+        SUM(CASE WHEN c.status = 'PENDIENTE_REGULARIZACION' THEN 1 ELSE 0 END) as pendientes_regularizacion,
         SUM(CASE WHEN c.status = 'CERRADO' THEN 1 ELSE 0 END) as cerrados
        FROM counts c ${countWhere}`
     )
@@ -2968,13 +5001,13 @@ app.get('/api/dashboard/executive', requireAuth, requireRole(UserRole.JEFE_STOCK
     .prepare(
       `SELECT u.id, u.full_name,
         COUNT(DISTINCT c.id) as total_counts,
-        SUM(CASE WHEN c.status IN ('ENVIADO_REVISION', 'VALIDADO', 'CERRADO') THEN 1 ELSE 0 END) as completed_counts,
+        SUM(CASE WHEN c.status IN ('PENDIENTE_APROBACION', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO') THEN 1 ELSE 0 END) as completed_counts,
         (SELECT COUNT(*) FROM count_items ci2 JOIN counts c2 ON c2.id = ci2.count_id
          WHERE c2.assigned_counter_id = u.id AND ci2.final_counted_qty IS NOT NULL) as total_items_counted,
         (SELECT COUNT(*) FROM count_items ci3 JOIN counts c3 ON c3.id = ci3.count_id
          WHERE c3.assigned_counter_id = u.id AND ci3.recount_qty IS NOT NULL) as recount_items,
-        ROUND(AVG(CASE WHEN c.submitted_at IS NOT NULL AND c.blind_printed_at IS NOT NULL
-          THEN (julianday(c.submitted_at) - julianday(c.blind_printed_at)) * 24.0 ELSE NULL END), 1) as avg_hours_execution
+        ROUND(AVG(CASE WHEN c.submitted_at IS NOT NULL AND c.executed_at IS NOT NULL
+          THEN (julianday(c.submitted_at) - julianday(c.executed_at)) * 24.0 ELSE NULL END), 1) as avg_hours_execution
        FROM users u
        LEFT JOIN counts c ON c.assigned_counter_id = u.id
        WHERE u.role = 'CONTADOR' AND u.is_active = 1
@@ -3064,12 +5097,18 @@ app.get('/api/dashboard/executive', requireAuth, requireRole(UserRole.JEFE_STOCK
   const liveCounts = db
     .prepare(
       `SELECT
-        SUM(CASE WHEN status IN ('PROGRAMADO', 'EN_PROGRESO', 'RECONTEO_SOLICITADO') THEN 1 ELSE 0 END) as active_counts,
-        SUM(CASE WHEN status = 'PROGRAMADO' THEN 1 ELSE 0 END) as programados,
-        SUM(CASE WHEN status = 'EN_PROGRESO' THEN 1 ELSE 0 END) as en_progreso,
-        SUM(CASE WHEN status = 'RECONTEO_SOLICITADO' THEN 1 ELSE 0 END) as reconteos,
-        SUM(CASE WHEN status = 'ENVIADO_REVISION' THEN 1 ELSE 0 END) as pending_validations,
-        SUM(CASE WHEN status = 'VALIDADO' THEN 1 ELSE 0 END) as awaiting_closure
+        COUNT(*) as total_created,
+        SUM(CASE WHEN status IN ('ASIGNADO', 'EN_EJECUCION', 'RECHAZADO') THEN 1 ELSE 0 END) as active_counts,
+        SUM(CASE WHEN status = 'BORRADOR' THEN 1 ELSE 0 END) as borradores,
+        SUM(CASE WHEN status = 'ASIGNADO' THEN 1 ELSE 0 END) as asignados,
+        SUM(CASE WHEN status = 'EN_EJECUCION' THEN 1 ELSE 0 END) as en_ejecucion,
+        SUM(CASE WHEN status = 'PENDIENTE_APROBACION' THEN 1 ELSE 0 END) as pendientes_aprobacion,
+        SUM(CASE WHEN status = 'RECHAZADO' THEN 1 ELSE 0 END) as rechazados,
+        SUM(CASE WHEN status = 'APROBADO' THEN 1 ELSE 0 END) as aprobados,
+        SUM(CASE WHEN status = 'PENDIENTE_REGULARIZACION' THEN 1 ELSE 0 END) as pendientes_regularizacion,
+        SUM(CASE WHEN status = 'CERRADO' THEN 1 ELSE 0 END) as cerrados,
+        SUM(CASE WHEN status IN ('ASIGNADO', 'EN_EJECUCION') THEN 1 ELSE 0 END) as pending_presentation,
+        SUM(CASE WHEN status != 'CERRADO' AND scheduled_date < date('now') THEN 1 ELSE 0 END) as overdue_counts
        FROM counts`
     )
     .get() as Record<string, number>;
@@ -3116,29 +5155,339 @@ app.get('/api/dashboard/executive', requireAuth, requireRole(UserRole.JEFE_STOCK
     )
     .get() as { sales_total: number; sales_count: number };
 
+  const trackingAlerts: Array<{
+    key: string;
+    severity: 'CRITICA' | 'ALTA' | 'MEDIA';
+    title: string;
+    count: number;
+    targetTab: 'management' | 'validation' | 'counts';
+    filterStatus?: string;
+  }> = [];
+
+  if (Number(liveCounts.overdue_counts || 0) > 0) {
+    trackingAlerts.push({
+      key: 'overdue',
+      severity: 'CRITICA',
+      title: `${liveCounts.overdue_counts} conteo(s) atrasado(s) respecto a su fecha programada`,
+      count: Number(liveCounts.overdue_counts || 0),
+      targetTab: 'management',
+    });
+  }
+  if (Number(liveCounts.pendientes_aprobacion || 0) > 0) {
+    trackingAlerts.push({
+      key: 'pending_approval',
+      severity: 'ALTA',
+      title: `${liveCounts.pendientes_aprobacion} conteo(s) pendiente(s) de aprobación por Control de Stock`,
+      count: Number(liveCounts.pendientes_aprobacion || 0),
+      targetTab: 'validation',
+      filterStatus: CountStatus.PENDIENTE_APROBACION,
+    });
+  }
+  if (Number(liveCounts.rechazados || 0) > 0) {
+    trackingAlerts.push({
+      key: 'rejected',
+      severity: 'ALTA',
+      title: `${liveCounts.rechazados} conteo(s) rechazado(s) sin resolver ni re-presentar`,
+      count: Number(liveCounts.rechazados || 0),
+      targetTab: 'management',
+      filterStatus: CountStatus.RECHAZADO,
+    });
+  }
+  if (Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0) > 0) {
+    const regPending = Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0);
+    trackingAlerts.push({
+      key: 'pending_regularization',
+      severity: 'MEDIA',
+      title: `${regPending} conteo(s) aprobado(s) pendiente(s) de regularización o cierre`,
+      count: regPending,
+      targetTab: 'validation',
+    });
+  }
+  if (Number(liveCounts.pending_presentation || 0) > 0) {
+    trackingAlerts.push({
+      key: 'pending_presentation',
+      severity: 'MEDIA',
+      title: `${liveCounts.pending_presentation} conteo(s) asignado(s) o en ejecución pendiente(s) de presentación`,
+      count: Number(liveCounts.pending_presentation || 0),
+      targetTab: 'management',
+    });
+  }
+
+  const programadosCompat = Number(liveCounts.borradores || 0) + Number(liveCounts.asignados || 0);
+  const aprobAndRegLive = Number(liveCounts.aprobados || 0) + Number(liveCounts.pendientes_regularizacion || 0);
+
+  // Active counts grouped by Counter (Contadores) for executive supervision
+  const activeScopeConds: string[] = ["c.status != 'CERRADO'"];
+  const activeScopeParams: unknown[] = [];
+  if (locationId) {
+    activeScopeConds.push('c.location_id = ?');
+    activeScopeParams.push(locationId);
+  }
+  if (counterId) {
+    activeScopeConds.push('c.assigned_counter_id = ?');
+    activeScopeParams.push(counterId);
+  }
+  const activeCountsRows = db
+    .prepare(
+      `SELECT c.id, c.count_number, c.location_id, l.name as location_name, l.group_type as location_group,
+        c.assigned_counter_id, COALESCE(u.full_name, 'Sin asignar') as counter_name,
+        COALESCE(u.username, '') as counter_username, COALESCE(u.role, '') as counter_role,
+        c.scheduled_date, c.status, c.weekly_goal_tag,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id) as items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND (ci.final_counted_qty IS NOT NULL OR ci.is_not_counted = 1)) as counted_items_count,
+        CASE WHEN c.scheduled_date < date('now') THEN 1 ELSE 0 END as is_overdue
+       FROM counts c
+       JOIN locations l ON l.id = c.location_id
+       LEFT JOIN users u ON u.id = c.assigned_counter_id
+       WHERE ${activeScopeConds.join(' AND ')}
+       ORDER BY is_overdue DESC, c.scheduled_date ASC, c.id DESC`
+    )
+    .all(...activeScopeParams) as Array<Record<string, unknown>>;
+
+  const counterUsersRows = db
+    .prepare(
+      `SELECT id, username, full_name, role, assigned_location_ids, assigned_families
+       FROM users
+       WHERE is_active = 1 AND role = 'CONTADOR'
+       ORDER BY full_name ASC`
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const locNameMap = new Map(
+    (db.prepare('SELECT id, name FROM locations').all() as Array<{ id: number; name: string }>).map((l) => [
+      l.id,
+      l.name,
+    ])
+  );
+
+  interface CounterBucket {
+    counterId: number | null;
+    counterName: string;
+    counterUsername: string;
+    role: string;
+    assignedLocationsLabel: string;
+    totalActive: number;
+    draftCount: number;
+    assignedCount: number;
+    inExecutionCount: number;
+    pendingApprovalCount: number;
+    rejectedCount: number;
+    regularizationCount: number;
+    overdueCount: number;
+    counts: Array<{
+      id: number;
+      count_number: string;
+      location_name: string;
+      location_group: string;
+      scheduled_date: string;
+      status: CountStatus;
+      items_count: number;
+      counted_items_count: number;
+      is_overdue: boolean;
+    }>;
+  }
+
+  const counterBucketsMap = new Map<string, CounterBucket>();
+
+  for (const cu of counterUsersRows) {
+    const cid = Number(cu.id);
+    if (counterId && cid !== counterId) continue;
+    let locIds: number[] = [];
+    try {
+      locIds = JSON.parse(String(cu.assigned_location_ids || '[]')).map(Number);
+    } catch {
+      locIds = [];
+    }
+    if (locationId && locIds.length > 0 && !locIds.includes(locationId)) continue;
+    const assignedLocationsLabel =
+      locIds.length > 0
+        ? locIds.map((id) => locNameMap.get(id) || `#${id}`).join(', ')
+        : 'Sin depósitos asignados';
+
+    counterBucketsMap.set(`user:${cid}`, {
+      counterId: cid,
+      counterName: String(cu.full_name),
+      counterUsername: String(cu.username),
+      role: String(cu.role),
+      assignedLocationsLabel,
+      totalActive: 0,
+      draftCount: 0,
+      assignedCount: 0,
+      inExecutionCount: 0,
+      pendingApprovalCount: 0,
+      rejectedCount: 0,
+      regularizationCount: 0,
+      overdueCount: 0,
+      counts: [],
+    });
+  }
+
+  for (const r of activeCountsRows) {
+    const cid = r.assigned_counter_id !== null && r.assigned_counter_id !== undefined ? Number(r.assigned_counter_id) : null;
+    const key = cid !== null ? `user:${cid}` : 'unassigned';
+    if (!counterBucketsMap.has(key)) {
+      counterBucketsMap.set(key, {
+        counterId: cid,
+        counterName: cid !== null ? String(r.counter_name) : 'Sin contador asignado (Borradores)',
+        counterUsername: cid !== null ? String(r.counter_username) : '',
+        role: cid !== null ? String(r.counter_role || 'JEFE_STOCK') : 'SIN_ASIGNAR',
+        assignedLocationsLabel: cid !== null ? 'Supervisión / Jefatura' : 'Pendiente de asignación',
+        totalActive: 0,
+        draftCount: 0,
+        assignedCount: 0,
+        inExecutionCount: 0,
+        pendingApprovalCount: 0,
+        rejectedCount: 0,
+        regularizationCount: 0,
+        overdueCount: 0,
+        counts: [],
+      });
+    }
+    const bucket = counterBucketsMap.get(key)!;
+    const st = String(r.status) as CountStatus;
+    const isOverdue = Boolean(r.is_overdue);
+    bucket.totalActive += 1;
+    if (st === CountStatus.BORRADOR) bucket.draftCount += 1;
+    else if (st === CountStatus.ASIGNADO) bucket.assignedCount += 1;
+    else if (st === CountStatus.EN_EJECUCION) bucket.inExecutionCount += 1;
+    else if (st === CountStatus.PENDIENTE_APROBACION) bucket.pendingApprovalCount += 1;
+    else if (st === CountStatus.RECHAZADO) bucket.rejectedCount += 1;
+    else if (st === CountStatus.APROBADO || st === CountStatus.PENDIENTE_REGULARIZACION) {
+      bucket.regularizationCount += 1;
+    }
+    if (isOverdue) bucket.overdueCount += 1;
+
+    bucket.counts.push({
+      id: Number(r.id),
+      count_number: String(r.count_number),
+      location_name: String(r.location_name),
+      location_group: String(r.location_group),
+      scheduled_date: String(r.scheduled_date),
+      status: st,
+      items_count: Number(r.items_count || 0),
+      counted_items_count: Number(r.counted_items_count || 0),
+      is_overdue: isOverdue,
+    });
+  }
+
+  const activeCountsByCounter = Array.from(counterBucketsMap.values()).sort(
+    (a, b) => b.totalActive - a.totalActive || a.counterName.localeCompare(b.counterName, 'es')
+  );
+
+  // Planned counts pending within the current calendar month
+  const monthlyConds: string[] = [
+    "c.status != 'CERRADO'",
+    "strftime('%Y-%m', c.scheduled_date) = strftime('%Y-%m', 'now')",
+  ];
+  const monthlyParams: unknown[] = [];
+  if (locationId) {
+    monthlyConds.push('c.location_id = ?');
+    monthlyParams.push(locationId);
+  }
+  if (counterId) {
+    monthlyConds.push('c.assigned_counter_id = ?');
+    monthlyParams.push(counterId);
+  }
+
+  const monthlyPendingCounts = db
+    .prepare(
+      `SELECT c.id, c.count_number, c.location_id, l.name as location_name, l.group_type as location_group,
+        c.assigned_counter_id, COALESCE(u.full_name, 'Sin asignar') as counter_name,
+        c.scheduled_date, c.status, c.weekly_goal_tag,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id) as items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND (ci.final_counted_qty IS NOT NULL OR ci.is_not_counted = 1)) as counted_items_count,
+        CASE WHEN c.scheduled_date < date('now') THEN 1 ELSE 0 END as is_overdue
+       FROM counts c
+       JOIN locations l ON l.id = c.location_id
+       LEFT JOIN users u ON u.id = c.assigned_counter_id
+       WHERE ${monthlyConds.join(' AND ')}
+       ORDER BY is_overdue DESC, c.scheduled_date ASC, c.id DESC`
+    )
+    .all(...monthlyParams);
+
+  // Closed counts (Conteos ya cerrados / finalizados)
+  const closedConds: string[] = ["c.status = 'CERRADO'", ...countConds];
+  const closedParams: unknown[] = [...countParams];
+  if (skuFilter) {
+    closedConds.push(
+      'EXISTS (SELECT 1 FROM count_items ci_f JOIN products p_f ON p_f.id = ci_f.product_id WHERE ci_f.count_id = c.id AND p_f.sku LIKE ?)'
+    );
+    closedParams.push(`%${skuFilter}%`);
+  }
+
+  const closedCounts = db
+    .prepare(
+      `SELECT c.id, c.count_number, l.name as location_name, l.group_type as location_group,
+        COALESCE(uc.full_name, 'Sin asignar') as counter_name,
+        c.scheduled_date, c.closed_at, c.chief_signature_name,
+        COALESCE(ucl.full_name, c.chief_signature_name, 'Jefatura') as closed_by_name,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id) as items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result = 'COINCIDENCIA') as matches_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE')) as discrepancies_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.adjustment_status IN ('AJUSTE', 'MOVIMIENTO')) as adjusted_items_count,
+        (SELECT COUNT(*) FROM count_items ci WHERE ci.count_id = c.id AND ci.adjustment_status = 'SIN_AJUSTE') as no_adjustment_items_count,
+        COALESCE((SELECT SUM(CASE WHEN ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE') AND ci.snapshot_cost_price IS NOT NULL THEN ci.difference * ci.snapshot_cost_price ELSE 0 END) FROM count_items ci WHERE ci.count_id = c.id), 0) as net_economic_diff,
+        COALESCE((SELECT SUM(CASE WHEN ci.reconciliation_result IN ('FALTANTE', 'SOBRANTE') AND ci.snapshot_cost_price IS NOT NULL THEN ABS(ci.difference) * ci.snapshot_cost_price ELSE 0 END) FROM count_items ci WHERE ci.count_id = c.id), 0) as abs_economic_diff
+       FROM counts c
+       JOIN locations l ON l.id = c.location_id
+       LEFT JOIN users uc ON uc.id = c.assigned_counter_id
+       LEFT JOIN users ucl ON ucl.id = c.closed_by_user_id
+       WHERE ${closedConds.join(' AND ')}
+       ORDER BY COALESCE(c.closed_at, c.updated_at, c.created_at) DESC, c.id DESC
+       LIMIT 50`
+    )
+    .all(...closedParams);
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+
   res.json({
     quickMetrics: {
       activeInventoryCounts: Number(liveCounts.active_counts || 0),
-      programados: Number(liveCounts.programados || 0),
-      enProgreso: Number(liveCounts.en_progreso || 0),
-      reconteos: Number(liveCounts.reconteos || 0),
+      programados: programadosCompat,
+      enProgreso: Number(liveCounts.en_ejecucion || 0),
+      reconteos: Number(liveCounts.rechazados || 0),
       activeStockUnits: Number(activeStockUnits || 0),
-      pendingValidations: Number(liveCounts.pending_validations || 0),
-      awaitingClosure: Number(liveCounts.awaiting_closure || 0),
+      pendingValidations: Number(liveCounts.pendientes_aprobacion || 0),
+      awaitingClosure: aprobAndRegLive,
       userDailySalesAmount: Number(userDailySales.sales_total || 0),
       userDailySalesCount: Number(userDailySales.sales_count || 0),
       userDailySalesUnits: Number(userDailySales.sales_units || 0),
       teamDailySalesAmount: Number(teamDailySales.sales_total || 0),
       teamDailySalesCount: Number(teamDailySales.sales_count || 0),
     },
+    workflowSummary: {
+      totalCreated: Number(liveCounts.total_created || 0),
+      borradores: Number(liveCounts.borradores || 0),
+      asignados: Number(liveCounts.asignados || 0),
+      enEjecucion: Number(liveCounts.en_ejecucion || 0),
+      pendientesAprobacion: Number(liveCounts.pendientes_aprobacion || 0),
+      rechazados: Number(liveCounts.rechazados || 0),
+      aprobados: Number(liveCounts.aprobados || 0),
+      pendientesRegularizacion: Number(liveCounts.pendientes_regularizacion || 0),
+      cerrados: Number(liveCounts.cerrados || 0),
+      overdueCounts: Number(liveCounts.overdue_counts || 0),
+    },
+    trackingAlerts,
+    currentMonth,
+    activeCountsByCounter,
+    monthlyPendingCounts,
+    closedCounts,
     general: {
       totalProducts,
       totalLocations,
-      ...countStats,
+      total_counts: Number(countStats.total_counts || 0),
+      programados: Number(countStats.borradores || 0) + Number(countStats.asignados || 0),
+      en_progreso: Number(countStats.en_ejecucion || 0),
+      en_revision: Number(countStats.pendientes_aprobacion || 0) + Number(countStats.rechazados || 0),
+      validados: Number(countStats.aprobados || 0) + Number(countStats.pendientes_regularizacion || 0),
+      cerrados: Number(countStats.cerrados || 0),
       compliancePct:
         countStats.total_counts > 0
           ? Math.round(
-              (((countStats.validados || 0) + (countStats.cerrados || 0) + (countStats.en_revision || 0)) /
+              (((countStats.aprobados || 0) +
+                (countStats.pendientes_regularizacion || 0) +
+                (countStats.cerrados || 0) +
+                (countStats.pendientes_aprobacion || 0)) /
                 countStats.total_counts) *
                 1000
             ) / 10
@@ -3189,9 +5538,14 @@ app.get('/api/notifications', requireAuth, (req: AuthenticatedRequest, res) => {
 });
 
 app.post('/api/notifications/:id/read', requireAuth, (req: AuthenticatedRequest, res) => {
+  const notifId = parsePositiveInt(req.params.id);
+  if (!notifId) {
+    res.status(400).json({ error: 'Identificador de notificación inválido.' });
+    return;
+  }
   db.prepare(
     'UPDATE notifications SET is_read = 1 WHERE id = ? AND (target_user_id = ? OR target_role = ?)'
-  ).run(Number(req.params.id), req.user!.id, req.user!.role);
+  ).run(notifId, req.user!.id, req.user!.role);
   res.json({ ok: true });
 });
 
@@ -3202,7 +5556,11 @@ app.post('/api/notifications/read-all', requireAuth, (req: AuthenticatedRequest,
   res.json({ ok: true });
 });
 
-app.get('/api/audit', requireAuth, requireRole(UserRole.JEFE_STOCK), (req, res) => {
+app.get(
+  '/api/audit',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION),
+  (req, res) => {
   const action = String(req.query.action || '').trim();
   const username = String(req.query.username || '').trim();
   const conds: string[] = [];
@@ -3222,55 +5580,444 @@ app.get('/api/audit', requireAuth, requireRole(UserRole.JEFE_STOCK), (req, res) 
   res.json({ events });
 });
 
-app.get('/api/admin/backup', requireAuth, requireRole(UserRole.JEFE_STOCK), (req: AuthenticatedRequest, res) => {
-  const tables = [
-    'locations',
-    'users',
-    'import_batches',
-    'products',
-    'inventory_balances',
-    'inventory_movements',
-    'risk_config',
-    'count_goals',
-    'counts',
-    'count_items',
-    'pos_operations',
-    'pos_operation_items',
-    'audit_events',
-  ];
+const BACKUP_TABLES_ORDER = [
+  'locations',
+  'users',
+  'import_batches',
+  'products',
+  'inventory_balances',
+  'inventory_movements',
+  'risk_config',
+  'count_goals',
+  'counts',
+  'count_items',
+  'count_state_history',
+  'count_submissions',
+  'attachments',
+  'pos_operations',
+  'pos_operation_items',
+  'notifications',
+  'audit_events',
+] as const;
 
-  const dump: Record<string, unknown> = {
-    exportedAt: new Date().toISOString(),
-    exportedBy: req.user!.username,
-    tables: {},
+interface BackupAttachmentFile {
+  attachmentId: number;
+  filename: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  sha256: string;
+  contentBase64: string;
+}
+
+interface BackupPayload {
+  backupVersion: number;
+  exportedAt: string;
+  exportedBy: string;
+  walConsistentSnapshot: boolean;
+  storageDiagnostics?: ReturnType<typeof getStorageDiagnostics>;
+  tables: Record<string, Array<Record<string, unknown>>>;
+  attachmentFiles: BackupAttachmentFile[];
+  integrity: {
+    algorithm: 'sha256';
+    tableRowCounts: Record<string, number>;
+    attachmentFilesCount: number;
+    missingAttachments: Array<{ id: number; filename: string; originalName: string }>;
+    checksumSha256: string;
   };
+}
 
-  for (const t of tables) {
-    if (t === 'users') {
-      (dump.tables as Record<string, unknown>)[t] = db
-        .prepare(
-          'SELECT id, username, full_name, email, role, assigned_location_ids, is_active, last_login_at, created_at FROM users'
-        )
-        .all();
-    } else {
-      (dump.tables as Record<string, unknown>)[t] = db.prepare(`SELECT * FROM ${t}`).all();
+function computeBackupChecksum(
+  tables: Record<string, Array<Record<string, unknown>>>,
+  attachmentFiles: BackupAttachmentFile[]
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ tables, attachmentFiles }))
+    .digest('hex');
+}
+
+function verifyBackupStructure(raw: unknown): {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  summary: {
+    backupVersion: number;
+    exportedAt: string;
+    totalTables: number;
+    totalRows: number;
+    attachmentFilesCount: number;
+    checksumMatch: boolean;
+    tableRowCounts: Record<string, number>;
+  } | null;
+} {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (!raw || typeof raw !== 'object') {
+    return { valid: false, errors: ['Formato JSON de respaldo inválido.'], warnings, summary: null };
+  }
+
+  const obj = raw as Partial<BackupPayload>;
+  if (!obj.tables || typeof obj.tables !== 'object') {
+    errors.push('Falta la sección "tables" en el respaldo.');
+  }
+  if (!Array.isArray(obj.attachmentFiles)) {
+    errors.push('Falta la sección "attachmentFiles" en el respaldo.');
+  }
+  if (!obj.integrity || typeof obj.integrity.checksumSha256 !== 'string') {
+    errors.push('Falta el manifiesto de integridad SHA-256.');
+  }
+
+  if (errors.length > 0) {
+    return { valid: false, errors, warnings, summary: null };
+  }
+
+  const tables = obj.tables as Record<string, Array<Record<string, unknown>>>;
+  const attachmentFiles = obj.attachmentFiles as BackupAttachmentFile[];
+
+  for (const t of BACKUP_TABLES_ORDER) {
+    if (!Array.isArray(tables[t])) {
+      errors.push(`Falta la tabla obligatoria "${t}" o no es un arreglo.`);
     }
   }
 
-  logAudit({
-    userId: req.user!.id,
-    username: req.user!.username,
-    action: 'DATABASE_BACKUP_EXPORTED',
-    entityType: 'SYSTEM',
-    ipAddress: getClientIp(req),
-  });
+  // Ensure no secrets or password hashes leaked into backup payload
+  const usersRows = Array.isArray(tables.users) ? tables.users : [];
+  for (const u of usersRows) {
+    if ('password_hash' in u) {
+      errors.push('El archivo contiene password_hash; se rechaza por política de seguridad.');
+      break;
+    }
+  }
 
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename="SICEP_Respaldo_${new Date().toISOString().slice(0, 10)}.json"`
-  );
-  res.send(JSON.stringify(dump, null, 2));
+  let checksumMatch = false;
+  if (errors.length === 0) {
+    const expected = computeBackupChecksum(tables, attachmentFiles);
+    checksumMatch = expected === obj.integrity!.checksumSha256;
+    if (!checksumMatch) {
+      errors.push('La firma SHA-256 del respaldo no coincide (archivo alterado o corrupto).');
+    }
+  }
+
+  for (const af of attachmentFiles) {
+    if (!af.filename || typeof af.contentBase64 !== 'string' || typeof af.sha256 !== 'string') {
+      errors.push(`Archivo adjunto malformado en el respaldo (${af.filename || 'sin nombre'}).`);
+      continue;
+    }
+    const safeName = path.basename(af.filename);
+    if (safeName !== af.filename || af.filename.includes('..')) {
+      errors.push(`Nombre de archivo adjunto inseguro en respaldo: ${af.filename}`);
+      continue;
+    }
+    const buf = Buffer.from(af.contentBase64, 'base64');
+    const actualHash = crypto.createHash('sha256').update(buf).digest('hex');
+    if (actualHash !== af.sha256) {
+      errors.push(`Checksum SHA-256 inválido en adjunto "${af.originalName || af.filename}".`);
+    }
+  }
+
+  if (obj.integrity?.missingAttachments && obj.integrity.missingAttachments.length > 0) {
+    warnings.push(
+      `Al momento de exportar faltaban ${obj.integrity.missingAttachments.length} archivo(s) físico(s) en disco.`
+    );
+  }
+
+  const tableRowCounts: Record<string, number> = {};
+  let totalRows = 0;
+  for (const t of BACKUP_TABLES_ORDER) {
+    const cnt = Array.isArray(tables[t]) ? tables[t].length : 0;
+    tableRowCounts[t] = cnt;
+    totalRows += cnt;
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+    summary: {
+      backupVersion: Number(obj.backupVersion || 1),
+      exportedAt: String(obj.exportedAt || ''),
+      totalTables: BACKUP_TABLES_ORDER.length,
+      totalRows,
+      attachmentFilesCount: attachmentFiles.length,
+      checksumMatch,
+      tableRowCounts,
+    },
+  };
+}
+
+app.get(
+  '/api/admin/backup',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  async (req: AuthenticatedRequest, res, next) => {
+    const tempSnapshotPath = path.join(
+      os.tmpdir(),
+      `sicep-backup-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.db`
+    );
+
+    try {
+      // Atomic WAL-consistent SQLite hot backup snapshot
+      await db.backup(tempSnapshotPath);
+
+      const snapDb = new Database(tempSnapshotPath, { readonly: true });
+      const tablesData: Record<string, Array<Record<string, unknown>>> = {};
+      const tableRowCounts: Record<string, number> = {};
+
+      try {
+        for (const t of BACKUP_TABLES_ORDER) {
+          const rows =
+            t === 'users'
+              ? (snapDb
+                  .prepare(
+                    'SELECT id, username, full_name, email, role, assigned_location_ids, assigned_families, token_version, password_changed_at, is_active, last_login_at, created_at, updated_at FROM users ORDER BY id ASC'
+                  )
+                  .all() as Array<Record<string, unknown>>)
+              : (snapDb.prepare(`SELECT * FROM ${t} ORDER BY id ASC`).all() as Array<
+                  Record<string, unknown>
+                >);
+          tablesData[t] = rows;
+          tableRowCounts[t] = rows.length;
+        }
+      } finally {
+        snapDb.close();
+      }
+
+      const attachmentFiles: BackupAttachmentFile[] = [];
+      const missingAttachments: Array<{ id: number; filename: string; originalName: string }> = [];
+      const attachmentRows = tablesData.attachments || [];
+
+      for (const att of attachmentRows) {
+        const filename = String(att.filename || '');
+        const resolved = path.resolve(UPLOADS_DIR, filename);
+        if (!filename || !resolved.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(resolved)) {
+          missingAttachments.push({
+            id: Number(att.id),
+            filename,
+            originalName: String(att.original_name || ''),
+          });
+          continue;
+        }
+        const buf = fs.readFileSync(resolved);
+        attachmentFiles.push({
+          attachmentId: Number(att.id),
+          filename,
+          originalName: String(att.original_name || filename),
+          mimeType: String(att.mime_type || 'application/octet-stream'),
+          sizeBytes: buf.length,
+          sha256: crypto.createHash('sha256').update(buf).digest('hex'),
+          contentBase64: buf.toString('base64'),
+        });
+      }
+
+      const checksumSha256 = computeBackupChecksum(tablesData, attachmentFiles);
+      const dump: BackupPayload = {
+        backupVersion: 2,
+        exportedAt: new Date().toISOString(),
+        exportedBy: req.user!.username,
+        walConsistentSnapshot: true,
+        storageDiagnostics: getStorageDiagnostics(),
+        tables: tablesData,
+        attachmentFiles,
+        integrity: {
+          algorithm: 'sha256',
+          tableRowCounts,
+          attachmentFilesCount: attachmentFiles.length,
+          missingAttachments,
+          checksumSha256,
+        },
+      };
+
+      logAudit({
+        userId: req.user!.id,
+        username: req.user!.username,
+        action: 'DATABASE_BACKUP_EXPORTED',
+        entityType: 'SYSTEM',
+        newValue: {
+          backupVersion: 2,
+          tableRowCounts,
+          attachmentFilesCount: attachmentFiles.length,
+          missingAttachmentsCount: missingAttachments.length,
+          checksumSha256,
+        },
+        ipAddress: getClientIp(req),
+      });
+
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="SICEP_Respaldo_${new Date().toISOString().slice(0, 10)}.json"`
+      );
+      res.send(JSON.stringify(dump, null, 2));
+    } catch (err) {
+      next(err);
+    } finally {
+      for (const suffix of ['', '-wal', '-shm']) {
+        const p = `${tempSnapshotPath}${suffix}`;
+        if (fs.existsSync(p)) {
+          try {
+            fs.unlinkSync(p);
+          } catch {
+            // ignore cleanup errors
+          }
+        }
+      }
+    }
+  }
+);
+
+app.post(
+  '/api/admin/backup/verify',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  (req: AuthenticatedRequest, res) => {
+    const check = verifyBackupStructure(req.body);
+    res.status(check.valid ? 200 : 400).json(check);
+  }
+);
+
+app.post(
+  '/api/admin/restore',
+  requireAuth,
+  requireRole(UserRole.JEFE_STOCK),
+  (req: AuthenticatedRequest, res) => {
+    const { backup, confirmRestore } = req.body as {
+      backup?: BackupPayload;
+      confirmRestore?: boolean;
+    };
+
+    if (!confirmRestore) {
+      res.status(400).json({ error: 'Debe confirmar explícitamente la restauración del respaldo.' });
+      return;
+    }
+
+    const check = verifyBackupStructure(backup);
+    if (!check.valid || !backup) {
+      res.status(400).json({
+        error: check.errors[0] || 'El respaldo no superó la verificación de integridad.',
+        errors: check.errors,
+        warnings: check.warnings,
+      });
+      return;
+    }
+
+    // Preserve local password hashes by username (backup intentionally never stores hashes)
+    const existingHashes = new Map<string, string>();
+    const existingUsers = db
+      .prepare('SELECT username, password_hash FROM users')
+      .all() as Array<{ username: string; password_hash: string }>;
+    for (const eu of existingUsers) {
+      existingHashes.set(eu.username.trim().toLowerCase(), eu.password_hash);
+    }
+
+    const usersRequiringPasswordReset: string[] = [];
+
+    // Restore attachment physical files safely before DB swap
+    if (!fs.existsSync(UPLOADS_DIR)) {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    }
+    for (const af of backup.attachmentFiles) {
+      const targetPath = path.resolve(UPLOADS_DIR, path.basename(af.filename));
+      if (!targetPath.startsWith(UPLOADS_DIR + path.sep)) {
+        res.status(400).json({ error: `Ruta de adjunto inválida: ${af.filename}` });
+        return;
+      }
+      fs.writeFileSync(targetPath, Buffer.from(af.contentBase64, 'base64'));
+    }
+
+    const insertRow = (table: string, row: Record<string, unknown>): void => {
+      const cols = Object.keys(row);
+      if (cols.length === 0) return;
+      const placeholders = cols.map(() => '?').join(',');
+      db.prepare(`INSERT INTO ${table} (${cols.join(',')}) VALUES (${placeholders})`).run(
+        ...cols.map((c) => row[c])
+      );
+    };
+
+    db.pragma('foreign_keys = OFF');
+    try {
+      const restoreTx = db.transaction(() => {
+        for (const t of [...BACKUP_TABLES_ORDER].reverse()) {
+          db.prepare(`DELETE FROM ${t}`).run();
+        }
+        db.prepare('DELETE FROM sqlite_sequence').run();
+
+        for (const t of BACKUP_TABLES_ORDER) {
+          const rows = backup.tables[t] || [];
+          for (const rawRow of rows) {
+            if (t === 'users') {
+              const uname = String(rawRow.username || '').trim().toLowerCase();
+              const preservedHash = existingHashes.get(uname);
+              let pwHash = preservedHash;
+              if (!pwHash) {
+                pwHash = hashPassword(crypto.randomBytes(24).toString('hex'));
+                usersRequiringPasswordReset.push(uname);
+              }
+              const restoredUserRow: Record<string, unknown> = {
+                ...rawRow,
+                password_hash: pwHash,
+                token_version: Number(rawRow.token_version ?? 1) + 1,
+              };
+              insertRow('users', restoredUserRow);
+            } else {
+              insertRow(t, rawRow);
+            }
+          }
+        }
+      });
+
+      restoreTx();
+
+      const fkViolations = db.pragma('foreign_key_check') as Array<unknown>;
+      if (fkViolations.length > 0) {
+        throw new Error(`Violación de integridad referencial tras restaurar (${fkViolations.length} fila(s)).`);
+      }
+
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+
+    logAudit({
+      userId: req.user!.id,
+      username: req.user!.username,
+      action: 'DATABASE_BACKUP_RESTORED',
+      entityType: 'SYSTEM',
+      newValue: {
+        backupVersion: backup.backupVersion,
+        exportedAt: backup.exportedAt,
+        restoredChecksum: backup.integrity.checksumSha256,
+        usersRequiringPasswordReset,
+      },
+      ipAddress: getClientIp(req),
+    });
+
+    res.json({
+      ok: true,
+      restoredTables: BACKUP_TABLES_ORDER.length,
+      restoredRows: check.summary?.totalRows || 0,
+      restoredAttachmentFiles: backup.attachmentFiles.length,
+      usersRequiringPasswordReset,
+      sessionRevoked: true,
+    });
+  }
+);
+
+app.all('/api/*', (_req, res) => {
+  res.status(404).json({ error: 'Endpoint no encontrado.' });
+});
+
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const errObj = err as { code?: string; message?: string; status?: number };
+  if (errObj?.code === 'LIMIT_FILE_SIZE') {
+    res.status(400).json({ error: 'El archivo supera el tamaño máximo permitido.' });
+    return;
+  }
+  const status = typeof errObj?.status === 'number' && errObj.status >= 400 ? errObj.status : 400;
+  res.status(status).json({
+    error: errObj?.message || 'Error al procesar la solicitud.',
+  });
 });
 
 // ============================================================================

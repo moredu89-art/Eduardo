@@ -4,8 +4,11 @@ import {
   Bell,
   BrainCircuit,
   ClipboardCheck,
+  ClipboardList,
+  Cloud,
   Database,
   FileCheck2,
+  FileSpreadsheet,
   ListChecks,
   LogOut,
   MapPin,
@@ -18,9 +21,12 @@ import {
 import { AnalyticsAiView } from './components/AnalyticsAiView';
 import { AuthScreen } from './components/AuthScreen';
 import { BlindSheetGeneratorView } from './components/BlindSheetGeneratorView';
+import { CloudSyncView } from './components/CloudSyncView';
 import { CountPlannerView } from './components/CountPlannerView';
+import { CountsManagementView } from './components/CountsManagementView';
 import { CountsWorkspaceView } from './components/CountsWorkspaceView';
 import { DashboardView } from './components/DashboardView';
+import { GoogleSheetsView } from './components/GoogleSheetsView';
 import { LocationsView } from './components/LocationsView';
 import { MasterCatalogView } from './components/MasterCatalogView';
 import { PosView } from './components/PosView';
@@ -35,11 +41,14 @@ type NavKey =
   | 'catalog'
   | 'locations'
   | 'planner'
+  | 'management'
   | 'counts'
   | 'blind-sheet'
   | 'validation'
   | 'ai'
   | 'pos'
+  | 'sheets'
+  | 'cloud'
   | 'users';
 
 interface NotificationRow {
@@ -57,6 +66,10 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [activeTab, setActiveTab] = useState<NavKey>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const [managementStatusFilter, setManagementStatusFilter] = useState<string>('');
+  const [workspaceInitialCountId, setWorkspaceInitialCountId] = useState<number | null>(null);
+  const [validationInitialCountId, setValidationInitialCountId] = useState<number | null>(null);
 
   const [notifications, setNotifications] = useState<NotificationRow[]>([]);
   const [notifOpen, setNotifOpen] = useState(false);
@@ -103,6 +116,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    void apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setAuthToken(null);
     setCurrentUser(null);
     setNotifications([]);
@@ -138,25 +152,41 @@ export default function App() {
       key: 'dashboard',
       label: 'Tablero Gerencial',
       icon: <BarChart3 className="w-4 h-4" />,
-      roles: [UserRole.JEFE_STOCK],
+      roles: [UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION],
     },
     {
       key: 'catalog',
       label: 'Almacén Maestro',
       icon: <Database className="w-4 h-4" />,
-      roles: [UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO],
+      roles: [UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO, UserRole.AUDITORIA_DIRECCION],
     },
     {
       key: 'locations',
       label: 'Ubicaciones (11)',
       icon: <MapPin className="w-4 h-4" />,
-      roles: [UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO],
+      roles: [
+        UserRole.JEFE_STOCK,
+        UserRole.CONTADOR,
+        UserRole.RESPONSABLE_DEPOSITO,
+        UserRole.AUDITORIA_DIRECCION,
+      ],
     },
     {
       key: 'planner',
       label: 'Planificador Inteligente',
       icon: <ListChecks className="w-4 h-4" />,
       roles: [UserRole.JEFE_STOCK],
+    },
+    {
+      key: 'management',
+      label: 'Gestión de Conteos',
+      icon: <ClipboardList className="w-4 h-4" />,
+      roles: [
+        UserRole.JEFE_STOCK,
+        UserRole.CONTADOR,
+        UserRole.RESPONSABLE_DEPOSITO,
+        UserRole.AUDITORIA_DIRECCION,
+      ],
     },
     {
       key: 'counts',
@@ -189,10 +219,25 @@ export default function App() {
       roles: [UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO],
     },
     {
+      key: 'sheets',
+      label: 'Google Sheets',
+      icon: <FileSpreadsheet className="w-4 h-4" />,
+      roles: [UserRole.JEFE_STOCK, UserRole.RESPONSABLE_DEPOSITO],
+    },
+    {
+      key: 'cloud',
+      label: 'Respaldo en la Nube',
+      icon: <Cloud className="w-4 h-4" />,
+      roles: [UserRole.JEFE_STOCK, UserRole.CONTADOR, UserRole.RESPONSABLE_DEPOSITO],
+    },
+    {
       key: 'users',
-      label: 'Usuarios y Auditoría',
+      label:
+        currentUser.role === UserRole.AUDITORIA_DIRECCION
+          ? 'Auditoría Inmutable'
+          : 'Usuarios y Auditoría',
       icon: <Shield className="w-4 h-4" />,
-      roles: [UserRole.JEFE_STOCK],
+      roles: [UserRole.JEFE_STOCK, UserRole.AUDITORIA_DIRECCION],
     },
   ];
 
@@ -203,9 +248,11 @@ export default function App() {
   const roleLabel =
     currentUser.role === UserRole.JEFE_STOCK
       ? 'Jefe de Control de Stock'
-      : currentUser.role === UserRole.CONTADOR
-        ? 'Responsable de Conteo'
-        : 'Responsable de Depósito';
+      : currentUser.role === UserRole.AUDITORIA_DIRECCION
+        ? 'Dirección / Auditoría Interna'
+        : currentUser.role === UserRole.CONTADOR
+          ? 'Responsable de Conteo'
+          : 'Responsable de Depósito';
 
   const sidebarContent = (
     <div className="flex flex-col h-full bg-white border-r border-slate-200 w-64">
@@ -228,6 +275,9 @@ export default function App() {
             <button
               key={item.key}
               onClick={() => {
+                if (item.key === 'management') setManagementStatusFilter('');
+                if (item.key === 'counts') setWorkspaceInitialCountId(null);
+                if (item.key === 'validation') setValidationInitialCountId(null);
                 setActiveTab(item.key);
                 setMobileMenuOpen(false);
               }}
@@ -362,9 +412,25 @@ export default function App() {
         </header>
 
         <main className="flex-1 p-4 sm:p-6 max-w-[1440px] w-full mx-auto print:p-0 print:max-w-none">
-          {activeTab === 'dashboard' && currentUser.role === UserRole.JEFE_STOCK && (
-            <DashboardView currentUser={currentUser} onNavigate={(tab) => setActiveTab(tab)} />
-          )}
+          {activeTab === 'dashboard' &&
+            (currentUser.role === UserRole.JEFE_STOCK ||
+              currentUser.role === UserRole.AUDITORIA_DIRECCION) && (
+              <DashboardView
+                currentUser={currentUser}
+                onNavigate={(tab, options) => {
+                  if (
+                    currentUser.role === UserRole.AUDITORIA_DIRECCION &&
+                    tab !== 'management'
+                  ) {
+                    return;
+                  }
+                  if (tab === 'management') {
+                    setManagementStatusFilter(options?.managementStatusFilter || '');
+                  }
+                  setActiveTab(tab);
+                }}
+              />
+            )}
           {activeTab === 'catalog' && currentUser.role !== UserRole.CONTADOR && (
             <MasterCatalogView currentUser={currentUser} />
           )}
@@ -372,18 +438,58 @@ export default function App() {
           {activeTab === 'planner' && currentUser.role === UserRole.JEFE_STOCK && (
             <CountPlannerView />
           )}
-          {activeTab === 'counts' && <CountsWorkspaceView currentUser={currentUser} />}
-          {activeTab === 'blind-sheet' && <BlindSheetGeneratorView currentUser={currentUser} />}
+          {activeTab === 'management' && (
+            <CountsManagementView
+              currentUser={currentUser}
+              initialStatusFilter={managementStatusFilter}
+              onOpenExecution={(countId) => {
+                setWorkspaceInitialCountId(countId);
+                setActiveTab('counts');
+              }}
+              onOpenValidation={(countId) => {
+                setValidationInitialCountId(countId);
+                setActiveTab('validation');
+              }}
+            />
+          )}
+          {activeTab === 'counts' && (
+            <CountsWorkspaceView
+              currentUser={currentUser}
+              initialCountId={workspaceInitialCountId}
+            />
+          )}
+          {activeTab === 'blind-sheet' && (
+            <BlindSheetGeneratorView
+              currentUser={currentUser}
+              onNavigateToManagement={() => {
+                setManagementStatusFilter('');
+                setActiveTab('management');
+              }}
+              onNavigateToWorkspace={(countId) => {
+                setWorkspaceInitialCountId(countId);
+                setActiveTab('counts');
+              }}
+            />
+          )}
           {activeTab === 'validation' && currentUser.role === UserRole.JEFE_STOCK && (
-            <ValidationClosureView currentUser={currentUser} />
+            <ValidationClosureView
+              currentUser={currentUser}
+              initialCountId={validationInitialCountId}
+            />
           )}
           {activeTab === 'ai' && currentUser.role === UserRole.JEFE_STOCK && <AnalyticsAiView />}
           {activeTab === 'pos' && currentUser.role !== UserRole.CONTADOR && (
             <PosView currentUser={currentUser} />
           )}
-          {activeTab === 'users' && currentUser.role === UserRole.JEFE_STOCK && (
-            <UsersAuditView currentUser={currentUser} />
+          {activeTab === 'sheets' && currentUser.role !== UserRole.CONTADOR && (
+            <GoogleSheetsView currentUser={currentUser} />
           )}
+          {activeTab === 'cloud' && <CloudSyncView currentUser={currentUser} />}
+          {activeTab === 'users' &&
+            (currentUser.role === UserRole.JEFE_STOCK ||
+              currentUser.role === UserRole.AUDITORIA_DIRECCION) && (
+              <UsersAuditView currentUser={currentUser} />
+            )}
         </main>
       </div>
     </div>

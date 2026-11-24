@@ -66,7 +66,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ needsBootstrap, onAuthen
               Merco<span className="text-[#fbc016]">Mat</span>
             </h1>
             <p className="text-xs text-red-100 mt-0.5">
-              Control de Inventarios · 11 Ubicaciones · Punto de Venta
+              Control de Stock
             </p>
           </div>
         </div>

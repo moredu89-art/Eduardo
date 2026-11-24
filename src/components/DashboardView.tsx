@@ -1,8 +1,22 @@
 import React, { useEffect, useState } from 'react';
-import { ArrowRight, BarChart3, Download, Filter, TrendingUp } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowRight,
+  BarChart3,
+  CalendarClock,
+  CheckCircle2,
+  Download,
+  Eye,
+  Filter,
+  Palette,
+  RotateCcw,
+  TrendingUp,
+  Users,
+} from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { getCountStatusMeta } from '../lib/countStatus';
 import { exportExecutiveSummaryPdf } from '../lib/pdfExport';
-import { AuthUser, UserRole } from '../types/erp';
+import { AuthUser, CountStatus, LocationGroup, UserRole } from '../types/erp';
 
 interface QuickMetrics {
   activeInventoryCounts: number;
@@ -19,8 +33,100 @@ interface QuickMetrics {
   teamDailySalesCount: number;
 }
 
+interface WorkflowSummary {
+  totalCreated: number;
+  borradores: number;
+  asignados: number;
+  enEjecucion: number;
+  pendientesAprobacion: number;
+  rechazados: number;
+  aprobados: number;
+  pendientesRegularizacion: number;
+  cerrados: number;
+  overdueCounts: number;
+}
+
+interface TrackingAlert {
+  key: string;
+  severity: 'CRITICA' | 'ALTA' | 'MEDIA';
+  title: string;
+  count: number;
+  targetTab: 'management' | 'validation' | 'counts';
+  filterStatus?: string;
+}
+
+interface ActiveCounterCountItem {
+  id: number;
+  count_number: string;
+  location_name: string;
+  location_group: LocationGroup | string;
+  scheduled_date: string;
+  status: CountStatus;
+  items_count: number;
+  counted_items_count: number;
+  is_overdue: boolean;
+}
+
+interface ActiveCountsByCounter {
+  counterId: number | null;
+  counterName: string;
+  counterUsername: string;
+  role: string;
+  assignedLocationsLabel: string;
+  totalActive: number;
+  draftCount: number;
+  assignedCount: number;
+  inExecutionCount: number;
+  pendingApprovalCount: number;
+  rejectedCount: number;
+  regularizationCount: number;
+  overdueCount: number;
+  counts: ActiveCounterCountItem[];
+}
+
+interface MonthlyPendingCountRow {
+  id: number;
+  count_number: string;
+  location_id: number;
+  location_name: string;
+  location_group: LocationGroup | string;
+  assigned_counter_id: number | null;
+  counter_name: string;
+  scheduled_date: string;
+  status: CountStatus;
+  weekly_goal_tag: string;
+  items_count: number;
+  counted_items_count: number;
+  is_overdue: number;
+}
+
+interface ClosedCountRow {
+  id: number;
+  count_number: string;
+  location_name: string;
+  location_group: LocationGroup | string;
+  counter_name: string;
+  scheduled_date: string;
+  closed_at: string | null;
+  chief_signature_name: string;
+  closed_by_name: string;
+  items_count: number;
+  matches_count: number;
+  discrepancies_count: number;
+  adjusted_items_count: number;
+  no_adjustment_items_count: number;
+  net_economic_diff: number;
+  abs_economic_diff: number;
+}
+
 interface ExecutiveData {
   quickMetrics: QuickMetrics;
+  workflowSummary?: WorkflowSummary;
+  trackingAlerts?: TrackingAlert[];
+  currentMonth?: string;
+  activeCountsByCounter?: ActiveCountsByCounter[];
+  monthlyPendingCounts?: MonthlyPendingCountRow[];
+  closedCounts?: ClosedCountRow[];
   general: {
     totalProducts: number;
     totalLocations: number;
@@ -86,10 +192,35 @@ interface ExecutiveData {
 
 interface DashboardViewProps {
   currentUser?: AuthUser;
-  onNavigate?: (tab: 'counts' | 'validation' | 'pos') => void;
+  onNavigate?: (
+    tab: 'management' | 'counts' | 'validation' | 'pos',
+    options?: { managementStatusFilter?: string }
+  ) => void;
 }
 
+const DEFAULT_H2_ACCENT = '#580a16';
+
+const H2_ACCENT_PRESETS = [
+  { label: 'Borgoña MercoMat', hex: '#580a16' },
+  { label: 'Carmesí', hex: '#8e0d0d' },
+  { label: 'Dorado', hex: '#d97706' },
+  { label: 'Azul Técnico', hex: '#1e40af' },
+  { label: 'Esmeralda', hex: '#047857' },
+  { label: 'Pizarra', hex: '#334155' },
+];
+
 export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNavigate }) => {
+  const accentStorageKey = `mercomat_dashboard_h2_accent_${currentUser?.id ?? 'default'}`;
+  const [headerAccent, setHeaderAccent] = useState<string>(() => {
+    try {
+      const saved = window.localStorage.getItem(accentStorageKey);
+      return saved && /^#[0-9a-fA-F]{6}$/.test(saved) ? saved : DEFAULT_H2_ACCENT;
+    } catch {
+      return DEFAULT_H2_ACCENT;
+    }
+  });
+  const [colorPickerOpen, setColorPickerOpen] = useState(false);
+
   const [locations, setLocations] = useState<Array<{ id: number; name: string }>>([]);
   const [counters, setCounters] = useState<AuthUser[]>([]);
   const [filters, setFilters] = useState({
@@ -105,6 +236,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
   const [exportingPdf, setExportingPdf] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const updateHeaderAccent = (hex: string) => {
+    setHeaderAccent(hex);
+    try {
+      window.localStorage.setItem(accentStorageKey, hex);
+    } catch {
+      // ignore storage quota errors
+    }
+  };
+
+  const isReadOnlyAudit = currentUser?.role === UserRole.AUDITORIA_DIRECCION;
+
   const loadDashboard = async () => {
     setLoading(true);
     setError(null);
@@ -116,14 +258,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
       if (filters.counterId) qs.set('counterId', filters.counterId);
       if (filters.sku) qs.set('sku', filters.sku);
 
-      const [execRes, locRes, usrRes] = await Promise.all([
+      const [execRes, locRes, cntRes] = await Promise.all([
         apiFetch<ExecutiveData>(`/api/dashboard/executive?${qs}`),
         apiFetch<{ locations: Array<{ id: number; name: string }> }>('/api/locations'),
-        apiFetch<{ users: AuthUser[] }>('/api/users'),
+        apiFetch<{ counters: AuthUser[] }>('/api/blind-sheet/counters'),
       ]);
       setData(execRes);
       setLocations(locRes.locations);
-      setCounters(usrRes.users.filter((u) => u.role === UserRole.CONTADOR));
+      setCounters(cntRes.counters.filter((u) => u.role === UserRole.CONTADOR));
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
@@ -173,10 +315,81 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-bold text-slate-900">Tablero de Control Gerencial</h2>
-          <p className="text-sm text-slate-600 mt-0.5">
+      <div className="flex flex-wrap items-start justify-between gap-4 bg-slate-50 border-b border-slate-200">
+        <div className="relative bg-slate-50 pb-4 font-bold text-lg">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2
+              className="text-2xl font-bold text-slate-900 border-l-4 pl-3 transition-colors"
+              style={{ borderColor: headerAccent }}
+            >
+              Tablero de Control Gerencial
+            </h2>
+            <button
+              type="button"
+              onClick={() => setColorPickerOpen((prev) => !prev)}
+              aria-expanded={colorPickerOpen}
+              aria-label="Personalizar color de acento del encabezado"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium text-slate-600 bg-white border border-slate-200 rounded-md hover:border-slate-300 hover:text-slate-900 transition-colors whitespace-nowrap"
+              title="Personalizar acento del encabezado"
+            >
+              <span
+                className="w-2.5 h-2.5 rounded-full border border-black/15 shrink-0"
+                style={{ backgroundColor: headerAccent }}
+              />
+              <Palette className="w-3 h-3" />
+              <span>Acento</span>
+            </button>
+          </div>
+
+          {colorPickerOpen && (
+            <div className="mt-2 inline-flex flex-wrap items-center gap-2 bg-white border border-slate-200 rounded-lg p-2.5 shadow-md z-20">
+              <span className="text-[11px] font-medium text-slate-600 mr-1">
+                Color del encabezado:
+              </span>
+              {H2_ACCENT_PRESETS.map((preset) => {
+                const isSelected = headerAccent.toLowerCase() === preset.hex.toLowerCase();
+                return (
+                  <button
+                    key={preset.hex}
+                    type="button"
+                    onClick={() => updateHeaderAccent(preset.hex)}
+                    title={preset.label}
+                    aria-label={`Color ${preset.label}`}
+                    className={`w-5 h-5 rounded-full border transition-transform ${
+                      isSelected ? 'scale-110 ring-2 ring-offset-1 ring-slate-800' : 'border-black/15 hover:scale-105'
+                    }`}
+                    style={{ backgroundColor: preset.hex }}
+                  />
+                );
+              })}
+              <label
+                className="inline-flex items-center gap-1 pl-1.5 ml-1 border-l border-slate-200 text-[11px] text-slate-600 cursor-pointer"
+                title="Elegir color personalizado"
+              >
+                <span>Otro</span>
+                <input
+                  type="color"
+                  value={headerAccent}
+                  onChange={(e) => updateHeaderAccent(e.target.value)}
+                  className="w-6 h-5 p-0 border-0 bg-transparent cursor-pointer"
+                  aria-label="Selector de color personalizado para el encabezado"
+                />
+              </label>
+              {headerAccent.toLowerCase() !== DEFAULT_H2_ACCENT && (
+                <button
+                  type="button"
+                  onClick={() => updateHeaderAccent(DEFAULT_H2_ACCENT)}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] text-slate-600 hover:text-slate-900 border border-slate-200 rounded"
+                  title="Restablecer color original"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Restablecer
+                </button>
+              )}
+            </div>
+          )}
+
+          <p className="text-sm font-normal text-slate-600 mt-1">
             Indicadores consolidados de cobertura, confiabilidad entre ERP y físico, impacto económico y productividad del equipo.
           </p>
         </div>
@@ -199,6 +412,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
         </div>
       </div>
 
+      {isReadOnlyAudit && (
+        <div className="px-4 py-2.5 bg-slate-100 border border-slate-300 rounded-xl flex flex-wrap items-center justify-between gap-2 text-xs text-slate-800">
+          <div className="flex items-center gap-2">
+            <Eye className="w-4 h-4 text-[#8e0d0d] shrink-0" />
+            <span>
+              <strong>Modo Supervisión Ejecutiva (Solo Lectura):</strong> Perfil habilitado para Gerencia General, Auditoría Interna y Dirección. Visualiza estado global de stock, conteos activos por contador, planificados del mes y conteos cerrados sin permisos de modificación.
+            </span>
+          </div>
+          {onNavigate && (
+            <button
+              type="button"
+              onClick={() => onNavigate('management')}
+              className="inline-flex items-center gap-1 font-semibold text-[#8e0d0d] hover:underline whitespace-nowrap"
+            >
+              Ver registro completo de conteos
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Quick Metrics Card Row */}
       {loading || !data ? (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -207,97 +441,547 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ currentUser, onNav
           ))}
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-slate-600">
-                  Conteos de Inventario Activos
-                </span>
-                {onNavigate && (
-                  <button
-                    type="button"
-                    onClick={() => onNavigate('counts')}
-                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
-                  >
-                    Ver conteos
-                    <ArrowRight className="w-3 h-3" />
-                  </button>
-                )}
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-600">
+                    Conteos de Inventario Activos
+                  </span>
+                  {onNavigate && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('management')}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
+                    >
+                      Gestión de conteos
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+                <div className="text-2xl font-mono font-bold text-slate-900 mt-1.5 tabular-nums">
+                  {data.quickMetrics.activeInventoryCounts}
+                </div>
               </div>
-              <div className="text-2xl font-mono font-bold text-slate-900 mt-1.5 tabular-nums">
-                {data.quickMetrics.activeInventoryCounts}
+              <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
+                {data.quickMetrics.programados} borr./asign. · {data.quickMetrics.enProgreso} en ejecución ·{' '}
+                {data.quickMetrics.reconteos} rechazados ·{' '}
+                {data.quickMetrics.activeStockUnits.toLocaleString('es-AR')} u. disp.
               </div>
             </div>
-            <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-              {data.quickMetrics.programados} programados · {data.quickMetrics.enProgreso} en progreso ·{' '}
-              {data.quickMetrics.reconteos} reconteo ·{' '}
-              {data.quickMetrics.activeStockUnits.toLocaleString('es-AR')} u. disp.
-            </div>
-          </div>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-slate-600">Validaciones Pendientes</span>
-                {onNavigate && (
-                  <button
-                    type="button"
-                    onClick={() => onNavigate('validation')}
-                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
-                  >
-                    Revisar
-                    <ArrowRight className="w-3 h-3" />
-                  </button>
-                )}
+            <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-600">
+                    Pendientes de Aprobación
+                  </span>
+                  {onNavigate && !isReadOnlyAudit && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('validation')}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
+                    >
+                      Bandeja de aprobación
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  )}
+                  {onNavigate && isReadOnlyAudit && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onNavigate('management', {
+                          managementStatusFilter: CountStatus.PENDIENTE_APROBACION,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
+                    >
+                      Ver pendientes
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+                <div
+                  className={`text-2xl font-mono font-bold mt-1.5 tabular-nums ${
+                    data.quickMetrics.pendingValidations > 0 ? 'text-amber-700' : 'text-slate-900'
+                  }`}
+                >
+                  {data.quickMetrics.pendingValidations}
+                </div>
               </div>
-              <div
-                className={`text-2xl font-mono font-bold mt-1.5 tabular-nums ${
-                  data.quickMetrics.pendingValidations > 0 ? 'text-amber-700' : 'text-slate-900'
-                }`}
-              >
-                {data.quickMetrics.pendingValidations}
+              <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
+                {data.quickMetrics.pendingValidations} esperando aprobación ·{' '}
+                {data.quickMetrics.awaitingClosure} aprob./pend. regularización
               </div>
             </div>
-            <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-              {data.quickMetrics.pendingValidations} esperando revisión ·{' '}
-              {data.quickMetrics.awaitingClosure} validado(s) por cerrar
-            </div>
-          </div>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs font-medium text-slate-600">
-                  Ventas Diarias ({currentUser ? currentUser.username : 'Usuario'})
-                </span>
-                {onNavigate && (
-                  <button
-                    type="button"
-                    onClick={() => onNavigate('pos')}
-                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
-                  >
-                    Ir al POS
-                    <ArrowRight className="w-3 h-3" />
-                  </button>
-                )}
+            <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-600">
+                    {isReadOnlyAudit
+                      ? 'Ventas Diarias Consolidadas (POS)'
+                      : `Ventas Diarias (${currentUser ? currentUser.username : 'Usuario'})`}
+                  </span>
+                  {onNavigate && !isReadOnlyAudit && (
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('pos')}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#8e0d0d] hover:underline whitespace-nowrap shrink-0"
+                    >
+                      Ir al POS
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+                <div className="text-2xl font-mono font-bold text-[#8e0d0d] mt-1.5 tabular-nums">
+                  $
+                  {data.quickMetrics.userDailySalesAmount.toLocaleString('es-AR', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </div>
               </div>
-              <div className="text-2xl font-mono font-bold text-[#8e0d0d] mt-1.5 tabular-nums">
-                $
-                {data.quickMetrics.userDailySalesAmount.toLocaleString('es-AR', {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
+              <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
+                {data.quickMetrics.userDailySalesCount} venta(s) ·{' '}
+                {data.quickMetrics.userDailySalesUnits} u. hoy · Global hoy: $
+                {data.quickMetrics.teamDailySalesAmount.toLocaleString('es-AR', {
+                  maximumFractionDigits: 0,
                 })}
               </div>
             </div>
-            <div className="text-[11px] text-slate-500 mt-2 tabular-nums">
-              {data.quickMetrics.userDailySalesCount} venta(s) ·{' '}
-              {data.quickMetrics.userDailySalesUnits} u. hoy · Global hoy: $
-              {data.quickMetrics.teamDailySalesAmount.toLocaleString('es-AR', {
-                maximumFractionDigits: 0,
-              })}
-            </div>
           </div>
+
+          {/* 8-State Workflow Tracking Bar */}
+          {data.workflowSummary && (
+            <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-bold text-slate-900">
+                    Seguimiento del Circuito de Conteos (Total creados:{' '}
+                    <span className="font-mono tabular-nums">
+                      {data.workflowSummary.totalCreated}
+                    </span>
+                    )
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Haga clic en cualquier estado para consultar sus conteos en Gestión de Conteos.
+                  </p>
+                </div>
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigate('management')}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-[#8e0d0d] hover:underline"
+                  >
+                    Abrir Gestión de Conteos
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+                {(
+                  [
+                    [CountStatus.BORRADOR, data.workflowSummary.borradores],
+                    [CountStatus.ASIGNADO, data.workflowSummary.asignados],
+                    [CountStatus.EN_EJECUCION, data.workflowSummary.enEjecucion],
+                    [CountStatus.PENDIENTE_APROBACION, data.workflowSummary.pendientesAprobacion],
+                    [CountStatus.RECHAZADO, data.workflowSummary.rechazados],
+                    [CountStatus.APROBADO, data.workflowSummary.aprobados],
+                    [
+                      CountStatus.PENDIENTE_REGULARIZACION,
+                      data.workflowSummary.pendientesRegularizacion,
+                    ],
+                    [CountStatus.CERRADO, data.workflowSummary.cerrados],
+                  ] as Array<[CountStatus, number]>
+                ).map(([st, countVal]) => {
+                  const meta = getCountStatusMeta(st);
+                  return (
+                    <button
+                      key={st}
+                      type="button"
+                      onClick={() => onNavigate?.('management', { managementStatusFilter: st })}
+                      className={`text-left p-2.5 rounded-lg border transition-colors hover:border-slate-400 ${meta.surfaceClass}`}
+                    >
+                      <div className="flex items-center gap-1.5 text-[11px] font-medium truncate">
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${meta.dotClass}`} />
+                        <span className={`truncate ${meta.textClass}`}>{meta.shortLabel}</span>
+                      </div>
+                      <div className={`text-xl font-mono font-bold mt-1 tabular-nums ${meta.textClass}`}>
+                        {countVal}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Active Operational Tracking Alerts */}
+          {data.trackingAlerts && data.trackingAlerts.length > 0 && (
+            <div className="bg-white border border-slate-200 rounded-xl p-4 space-y-2.5">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-900">
+                <AlertTriangle className="w-4 h-4 text-amber-600" />
+                <span>Alertas Activas de Conteos</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {data.trackingAlerts.map((al) => (
+                  <div
+                    key={al.key}
+                    className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-xs ${
+                      al.severity === 'CRITICA'
+                        ? 'bg-red-50 border-red-200 text-red-900'
+                        : al.severity === 'ALTA'
+                          ? 'bg-amber-50 border-amber-200 text-amber-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-800'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <span className="font-mono font-bold mr-1.5">[{al.severity}]</span>
+                      <span>{al.title}</span>
+                    </div>
+                    {onNavigate && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onNavigate(isReadOnlyAudit ? 'management' : al.targetTab, {
+                            managementStatusFilter: al.filterStatus || '',
+                          })
+                        }
+                        className="inline-flex items-center gap-1 font-semibold hover:underline shrink-0 whitespace-nowrap"
+                      >
+                        {isReadOnlyAudit ? 'Consultar' : 'Atender'}
+                        <ArrowRight className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Executive Oversight: Active Counts by Counter */}
+          {data.activeCountsByCounter && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Users className="w-4 h-4 text-[#8e0d0d]" />
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Conteos Activos por Contador
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Carga operativa vigente, avance físico y alertas de atraso por responsable de conteo.
+                    </p>
+                  </div>
+                </div>
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() => onNavigate('management')}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-[#8e0d0d] hover:underline"
+                  >
+                    Ir a Gestión de Conteos
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {data.activeCountsByCounter.length === 0 ? (
+                <p className="text-xs text-slate-500 py-4 text-center">
+                  No hay contadores ni conteos activos para los filtros seleccionados.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {data.activeCountsByCounter.map((grp) => (
+                    <div
+                      key={grp.counterId !== null ? `cnt-${grp.counterId}` : 'cnt-unassigned'}
+                      className="border border-slate-200 rounded-lg p-3.5 space-y-2.5 bg-slate-50/40"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-slate-900">
+                            {grp.counterName}
+                            {grp.counterUsername && (
+                              <span className="ml-1.5 font-mono font-normal text-[11px] text-slate-500">
+                                ({grp.counterUsername})
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-500 truncate max-w-md">
+                            {grp.assignedLocationsLabel}
+                          </div>
+                        </div>
+                        <div className="text-right tabular-nums">
+                          <span className="inline-block px-2 py-0.5 text-xs font-mono font-bold bg-white border border-slate-300 rounded text-slate-900">
+                            {grp.totalActive} activo(s)
+                          </span>
+                          {grp.overdueCount > 0 && (
+                            <span className="ml-1.5 inline-block px-2 py-0.5 text-[11px] font-mono font-semibold bg-red-50 border border-red-200 rounded text-red-700">
+                              {grp.overdueCount} atrasado(s)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-5 gap-1.5 text-[11px] text-center tabular-nums">
+                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
+                          <div className="text-slate-500">Asign.</div>
+                          <div className="font-mono font-bold text-slate-900">{grp.assignedCount}</div>
+                        </div>
+                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
+                          <div className="text-slate-500">Ejec.</div>
+                          <div className="font-mono font-bold text-sky-700">{grp.inExecutionCount}</div>
+                        </div>
+                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
+                          <div className="text-slate-500">Pend.Apr.</div>
+                          <div className="font-mono font-bold text-amber-700">
+                            {grp.pendingApprovalCount}
+                          </div>
+                        </div>
+                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
+                          <div className="text-slate-500">Rech.</div>
+                          <div className="font-mono font-bold text-red-700">{grp.rejectedCount}</div>
+                        </div>
+                        <div className="bg-white border border-slate-200 rounded py-1 px-1">
+                          <div className="text-slate-500">Regul.</div>
+                          <div className="font-mono font-bold text-emerald-700">
+                            {grp.regularizationCount}
+                          </div>
+                        </div>
+                      </div>
+
+                      {grp.counts.length === 0 ? (
+                        <div className="text-[11px] text-slate-500 italic py-1">
+                          Sin conteos activos asignados en este momento.
+                        </div>
+                      ) : (
+                        <div className="bg-white border border-slate-200 rounded divide-y divide-slate-100 max-h-44 overflow-y-auto">
+                          {grp.counts.map((c) => {
+                            const meta = getCountStatusMeta(c.status);
+                            return (
+                              <div
+                                key={c.id}
+                                className="px-2.5 py-1.5 flex items-center justify-between gap-2 text-[11px]"
+                              >
+                                <div className="min-w-0">
+                                  <span className="font-mono font-bold text-slate-900">
+                                    {c.count_number}
+                                  </span>
+                                  <span className="mx-1 text-slate-400">·</span>
+                                  <span className="text-slate-700">{c.location_name}</span>
+                                  <span className="ml-1.5 font-mono text-slate-500">
+                                    ({c.scheduled_date})
+                                  </span>
+                                  {c.is_overdue && (
+                                    <span className="ml-1 font-semibold text-red-700">[Atrasado]</span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <span className="font-mono text-slate-500 tabular-nums">
+                                    {c.counted_items_count}/{c.items_count}
+                                  </span>
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded border text-[10px] font-semibold ${meta.surfaceClass} ${meta.textClass}`}
+                                  >
+                                    {meta.shortLabel}
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Executive Oversight: Planned Counts Pending in Current Month */}
+          {data.monthlyPendingCounts && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <CalendarClock className="w-4 h-4 text-[#8e0d0d]" />
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Conteos Planificados Pendientes del Mes ({data.currentMonth || 'Mes Actual'})
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Planificaciones del mes corriente que aún no alcanzaron el estado Cerrado / Finalizado.
+                    </p>
+                  </div>
+                </div>
+                <span className="text-xs font-mono font-semibold text-slate-700 bg-slate-50 border border-slate-200 rounded px-2.5 py-1 tabular-nums">
+                  {data.monthlyPendingCounts.length} pendiente(s) en el mes
+                </span>
+              </div>
+
+              {data.monthlyPendingCounts.length === 0 ? (
+                <p className="text-xs text-slate-500 py-5 text-center">
+                  No quedan conteos planificados pendientes de cierre para el mes en curso.
+                </p>
+              ) : (
+                <div className="overflow-x-auto max-h-72 border border-slate-200 rounded-lg">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-600">
+                        <th className="py-2 px-3">Nro. Conteo</th>
+                        <th className="py-2 px-3">Fecha Prog.</th>
+                        <th className="py-2 px-3">Depósito / Ubicación</th>
+                        <th className="py-2 px-3">Contador Asignado</th>
+                        <th className="py-2 px-3 text-right">Avance</th>
+                        <th className="py-2 px-3">Origen / Meta</th>
+                        <th className="py-2 px-3">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.monthlyPendingCounts.map((mc) => {
+                        const meta = getCountStatusMeta(mc.status);
+                        const overdue = Boolean(mc.is_overdue);
+                        return (
+                          <tr
+                            key={mc.id}
+                            className={`border-b border-slate-100 ${overdue ? 'bg-red-50/40' : 'hover:bg-slate-50'}`}
+                          >
+                            <td className="py-2 px-3 font-mono font-bold text-slate-900 whitespace-nowrap">
+                              {mc.count_number}
+                            </td>
+                            <td className="py-2 px-3 font-mono whitespace-nowrap">
+                              <span className={overdue ? 'text-red-700 font-semibold' : 'text-slate-700'}>
+                                {mc.scheduled_date}
+                              </span>
+                              {overdue && (
+                                <span className="ml-1.5 text-[10px] font-semibold text-red-700">
+                                  (Atrasado)
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 font-medium text-slate-800 whitespace-nowrap">
+                              {mc.location_name}
+                            </td>
+                            <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                              {mc.counter_name}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              {mc.counted_items_count}/{mc.items_count}
+                            </td>
+                            <td className="py-2 px-3 text-slate-600">
+                              {mc.weekly_goal_tag || 'Planificación estándar'}
+                            </td>
+                            <td className="py-2 px-3 whitespace-nowrap">
+                              <span
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-semibold ${meta.surfaceClass} ${meta.textClass}`}
+                              >
+                                <span className={`w-1.5 h-1.5 rounded-sm ${meta.dotClass}`} />
+                                {meta.shortLabel}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Executive Oversight: Closed / Finalized Counts */}
+          {data.closedCounts && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900">
+                      Conteos Cerrados / Finalizados
+                    </h3>
+                    <p className="text-[11px] text-slate-500">
+                      Auditorías de inventario concluidas con validación del Jefe de Control de Stock, regularización ERP y firma de cierre.
+                    </p>
+                  </div>
+                </div>
+                {onNavigate && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onNavigate('management', { managementStatusFilter: CountStatus.CERRADO })
+                    }
+                    className="inline-flex items-center gap-1 text-xs font-medium text-[#8e0d0d] hover:underline"
+                  >
+                    Ver historial cerrado completo
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {data.closedCounts.length === 0 ? (
+                <p className="text-xs text-slate-500 py-5 text-center">
+                  Aún no hay conteos cerrados para los filtros seleccionados.
+                </p>
+              ) : (
+                <div className="overflow-x-auto max-h-80 border border-slate-200 rounded-lg">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-left text-slate-600">
+                        <th className="py-2 px-3">Nro. Conteo</th>
+                        <th className="py-2 px-3">Cierre</th>
+                        <th className="py-2 px-3">Depósito</th>
+                        <th className="py-2 px-3">Contador</th>
+                        <th className="py-2 px-3">Validado / Cerrado por</th>
+                        <th className="py-2 px-3 text-right">Coincid. / Ítems</th>
+                        <th className="py-2 px-3 text-right">Diferencias</th>
+                        <th className="py-2 px-3 text-right">Regularización</th>
+                        <th className="py-2 px-3 text-right">Impacto Econ.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.closedCounts.map((cc) => (
+                        <tr key={cc.id} className="border-b border-slate-100 hover:bg-slate-50">
+                          <td className="py-2 px-3 font-mono font-bold text-slate-900 whitespace-nowrap">
+                            {cc.count_number}
+                          </td>
+                          <td className="py-2 px-3 font-mono text-slate-600 whitespace-nowrap">
+                            {cc.closed_at ? String(cc.closed_at).slice(0, 16).replace('T', ' ') : cc.scheduled_date}
+                          </td>
+                          <td className="py-2 px-3 font-medium text-slate-800 whitespace-nowrap">
+                            {cc.location_name}
+                          </td>
+                          <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                            {cc.counter_name}
+                          </td>
+                          <td className="py-2 px-3 text-slate-700 whitespace-nowrap">
+                            {cc.chief_signature_name || cc.closed_by_name}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                            {cc.matches_count}/{cc.items_count}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap">
+                            <span className={cc.discrepancies_count > 0 ? 'text-red-700' : 'text-emerald-700'}>
+                              {cc.discrepancies_count}
+                            </span>
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono text-[11px] text-slate-600 tabular-nums whitespace-nowrap">
+                            {cc.adjusted_items_count} aj. / {cc.no_adjustment_items_count} s/aj.
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono font-semibold tabular-nums whitespace-nowrap text-slate-900">
+                            ${Math.abs(Number(cc.abs_economic_diff || 0)).toLocaleString('es-AR', {
+                              maximumFractionDigits: 0,
+                            })}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 

@@ -1,60 +1,74 @@
-export enum UserRole {
-  JEFE_STOCK = 'JEFE_STOCK',
-  CONTADOR = 'CONTADOR',
-  RESPONSABLE_DEPOSITO = 'RESPONSABLE_DEPOSITO',
-}
+export const UserRole = {
+  JEFE_STOCK: 'JEFE_STOCK',
+  CONTADOR: 'CONTADOR',
+  RESPONSABLE_DEPOSITO: 'RESPONSABLE_DEPOSITO',
+  AUDITORIA_DIRECCION: 'AUDITORIA_DIRECCION',
+} as const;
+export type UserRole = (typeof UserRole)[keyof typeof UserRole];
 
-export enum LocationGroup {
-  CASA_CENTRAL = 'CASA_CENTRAL',
-  SUCURSAL = 'SUCURSAL',
-}
+export const LocationGroup = {
+  CASA_CENTRAL: 'CASA_CENTRAL',
+  SUCURSAL: 'SUCURSAL',
+} as const;
+export type LocationGroup = (typeof LocationGroup)[keyof typeof LocationGroup];
 
-export enum CriticalityLevel {
-  ALTA = 'ALTA',
-  MEDIA = 'MEDIA',
-  BAJA = 'BAJA',
-}
+export const CriticalityLevel = {
+  ALTA: 'ALTA',
+  MEDIA: 'MEDIA',
+  BAJA: 'BAJA',
+} as const;
+export type CriticalityLevel = (typeof CriticalityLevel)[keyof typeof CriticalityLevel];
 
-export enum RiskTier {
-  CRITICO = 'CRITICO',
-  ALTO = 'ALTO',
-  MEDIO = 'MEDIO',
-  BAJO = 'BAJO',
-}
+export const RiskTier = {
+  CRITICO: 'CRITICO',
+  ALTO: 'ALTO',
+  MEDIO: 'MEDIO',
+  BAJO: 'BAJO',
+} as const;
+export type RiskTier = (typeof RiskTier)[keyof typeof RiskTier];
 
-export enum CountStatus {
-  PROGRAMADO = 'PROGRAMADO',
-  EN_PROGRESO = 'EN_PROGRESO',
-  ENVIADO_REVISION = 'ENVIADO_REVISION',
-  RECONTEO_SOLICITADO = 'RECONTEO_SOLICITADO',
-  VALIDADO = 'VALIDADO',
-  CERRADO = 'CERRADO',
-}
+export const CountStatus = {
+  BORRADOR: 'BORRADOR',
+  ASIGNADO: 'ASIGNADO',
+  EN_EJECUCION: 'EN_EJECUCION',
+  PENDIENTE_APROBACION: 'PENDIENTE_APROBACION',
+  RECHAZADO: 'RECHAZADO',
+  APROBADO: 'APROBADO',
+  PENDIENTE_REGULARIZACION: 'PENDIENTE_REGULARIZACION',
+  CERRADO: 'CERRADO',
+} as const;
+export type CountStatus = (typeof CountStatus)[keyof typeof CountStatus];
 
-export enum ReconciliationResult {
-  COINCIDENCIA = 'COINCIDENCIA',
-  FALTANTE = 'FALTANTE',
-  SOBRANTE = 'SOBRANTE',
-}
+export const ReconciliationResult = {
+  COINCIDENCIA: 'COINCIDENCIA',
+  FALTANTE: 'FALTANTE',
+  SOBRANTE: 'SOBRANTE',
+} as const;
+export type ReconciliationResult =
+  (typeof ReconciliationResult)[keyof typeof ReconciliationResult];
 
-export enum AdjustmentOperationType {
-  PENDIENTE = 'PENDIENTE',
-  AJUSTE = 'AJUSTE',
-  MOVIMIENTO = 'MOVIMIENTO',
-  SIN_AJUSTE = 'SIN_AJUSTE',
-}
+export const AdjustmentOperationType = {
+  PENDIENTE: 'PENDIENTE',
+  AJUSTE: 'AJUSTE',
+  MOVIMIENTO: 'MOVIMIENTO',
+  SIN_AJUSTE: 'SIN_AJUSTE',
+} as const;
+export type AdjustmentOperationType =
+  (typeof AdjustmentOperationType)[keyof typeof AdjustmentOperationType];
 
-export enum PosOperationType {
-  VENTA = 'VENTA',
-  RESERVA = 'RESERVA',
-  DEVOLUCION = 'DEVOLUCION',
-}
+export const PosOperationType = {
+  VENTA: 'VENTA',
+  RESERVA: 'RESERVA',
+  DEVOLUCION: 'DEVOLUCION',
+} as const;
+export type PosOperationType = (typeof PosOperationType)[keyof typeof PosOperationType];
 
-export enum PosOperationStatus {
-  PENDIENTE = 'PENDIENTE',
-  CONFIRMADA = 'CONFIRMADA',
-  ANULADA = 'ANULADA',
-}
+export const PosOperationStatus = {
+  PENDIENTE: 'PENDIENTE',
+  CONFIRMADA: 'CONFIRMADA',
+  ANULADA: 'ANULADA',
+} as const;
+export type PosOperationStatus = (typeof PosOperationStatus)[keyof typeof PosOperationStatus];
 
 export interface AuthUser {
   id: number;

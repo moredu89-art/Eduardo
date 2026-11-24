@@ -4,14 +4,18 @@ import {
   Camera,
   CheckCircle2,
   ClipboardCheck,
+  Download,
   FileSpreadsheet,
   Paperclip,
+  Play,
   Printer,
   Save,
   Send,
   ShieldAlert,
+  Upload,
 } from 'lucide-react';
 import { apiFetch, getAuthToken } from '../lib/api';
+import { getCountStatusMeta } from '../lib/countStatus';
 import { exportBlindCountSheetPdf, MERCOMAT_LOGO_URL } from '../lib/pdfExport';
 import { AuthUser, CountStatus, UserRole } from '../types/erp';
 
@@ -23,12 +27,13 @@ interface CountSummary {
   location_name: string;
   location_group: string;
   scheduled_date: string;
-  assigned_counter_id: number;
+  assigned_counter_id: number | null;
   counter_name: string;
   warehouse_manager_name: string | null;
   status: CountStatus;
   items_count: number;
   counted_items_count: number;
+  not_counted_items_count?: number;
   discrepancies_count: number | null;
   weekly_goal_tag: string;
   counter_signature_name: string;
@@ -49,6 +54,8 @@ interface CountItemDetail {
   bulk_qty: number | null;
   loose_qty: number | null;
   counted_qty: number | null;
+  is_not_counted?: number;
+  not_counted_reason?: string;
   recount_bulk_qty: number | null;
   recount_loose_qty: number | null;
   recount_qty: number | null;
@@ -61,9 +68,25 @@ interface CountItemDetail {
   attachments: Array<{ id: number; original_name: string; mime_type: string }>;
 }
 
+interface CountSubmissionSummary {
+  id: number;
+  version_number: number;
+  submitted_by_full_name: string | null;
+  submitted_by_username: string;
+  counter_signature_name: string;
+  warehouse_signature_name: string;
+  general_observations: string;
+  outcome_status: string;
+  review_notes: string;
+  reviewed_at: string | null;
+  created_at: string;
+}
+
 interface CountItemInputState {
   bulkQty: string;
   looseQty: string;
+  isNotCounted: boolean;
+  notCountedReason: string;
   obs: string;
 }
 
@@ -74,44 +97,36 @@ function isValidRequiredQty(raw: string): boolean {
   return Number.isFinite(num) && num >= 0;
 }
 
-export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ currentUser }) => {
+interface CountsWorkspaceViewProps {
+  currentUser: AuthUser;
+  initialCountId?: number | null;
+}
+
+export const CountsWorkspaceView: React.FC<CountsWorkspaceViewProps> = ({
+  currentUser,
+  initialCountId = null,
+}) => {
   const [counts, setCounts] = useState<CountSummary[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(initialCountId);
   const [detail, setDetail] = useState<{
     count: Record<string, unknown>;
     items: CountItemDetail[];
     isBlindRestricted: boolean;
     postSnapshotMovements: Array<Record<string, unknown>>;
+    sheetAttachments: Array<{ id: number; original_name: string; mime_type: string }>;
+    submissions: CountSubmissionSummary[];
   } | null>(null);
 
   const [inputs, setInputs] = useState<Record<number, CountItemInputState>>({});
   const [validationAttempted, setValidationAttempted] = useState(false);
   const [counterSig, setCounterSig] = useState(currentUser.fullName);
+  const [generalObservations, setGeneralObservations] = useState('');
   const [whSig, setWhSig] = useState(currentUser.fullName);
   const [whNotes, setWhNotes] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const loadCounts = async () => {
-    setLoading(true);
-    try {
-      const res = await apiFetch<{ counts: CountSummary[] }>('/api/counts');
-      setCounts(res.counts);
-      if (selectedId) {
-        await openCount(selectedId);
-      }
-    } catch (err: unknown) {
-      setError((err as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadCounts();
-  }, []);
 
   const openCount = async (id: number) => {
     setSelectedId(id);
@@ -123,9 +138,20 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
         items: CountItemDetail[];
         isBlindRestricted: boolean;
         postSnapshotMovements: Array<Record<string, unknown>>;
+        sheetAttachments?: Array<{ id: number; original_name: string; mime_type: string }>;
+        submissions?: CountSubmissionSummary[];
       }>(`/api/counts/${id}`);
-      setDetail(res);
-      const isRecount = res.count.status === CountStatus.RECONTEO_SOLICITADO;
+
+      setDetail({
+        count: res.count,
+        items: res.items,
+        isBlindRestricted: res.isBlindRestricted,
+        postSnapshotMovements: res.postSnapshotMovements || [],
+        sheetAttachments: res.sheetAttachments || [],
+        submissions: res.submissions || [],
+      });
+
+      const isRecount = res.count.status === CountStatus.RECHAZADO;
       const map: Record<number, CountItemInputState> = {};
       for (const it of res.items) {
         const bulkVal = isRecount ? it.recount_bulk_qty : it.bulk_qty;
@@ -139,13 +165,53 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                 ? String(legacyTotal)
                 : '',
           looseQty: looseVal !== null && looseVal !== undefined ? String(looseVal) : '',
+          isNotCounted: Number(it.is_not_counted || 0) === 1,
+          notCountedReason: it.not_counted_reason || '',
           obs: it.counter_observations || '',
         };
       }
       setInputs(map);
+      setCounterSig(String(res.count.counter_signature_name || currentUser.fullName));
+      setGeneralObservations(String(res.count.counter_general_notes || ''));
       setWhNotes(String(res.count.warehouse_confirmed_notes || ''));
     } catch (err: unknown) {
       setError((err as Error).message);
+    }
+  };
+
+  const loadCounts = async (targetOpenId?: number | null) => {
+    setLoading(true);
+    try {
+      const res = await apiFetch<{ counts: CountSummary[] }>('/api/counts');
+      setCounts(res.counts);
+      const idToOpen = targetOpenId ?? selectedId;
+      if (idToOpen) {
+        await openCount(idToOpen);
+      }
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadCounts(initialCountId);
+  }, [initialCountId]);
+
+  const handleStartCount = async () => {
+    if (!detail) return;
+    setError(null);
+    setMessage(null);
+    setSaving(true);
+    try {
+      await apiFetch(`/api/counts/${detail.count.id}/start`, { method: 'POST' });
+      setMessage('Ejecución del conteo iniciada.');
+      await loadCounts(Number(detail.count.id));
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -182,14 +248,14 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
           : uniqueBrands.length > 1
             ? 'Varios rubros'
             : 'General',
-      counterName: String(detail.count.counter_name),
+      counterName: String(detail.count.counter_name || 'Sin asignar'),
       items: detail.items.map((i) => ({
         sku: i.sku,
         description: i.description,
         unitOfMeasure: i.unit_of_measure,
       })),
     });
-    await loadCounts();
+    await loadCounts(Number(detail.count.id));
   };
 
   const handleImportExcelResults = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -222,6 +288,8 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
               ? String(m.bulkQty)
               : String(m.countedQty),
           looseQty: m.looseQty !== null && m.looseQty !== undefined ? String(m.looseQty) : '',
+          isNotCounted: false,
+          notCountedReason: '',
           obs: m.observations || nextInputs[m.itemId]?.obs || '',
         };
       }
@@ -254,55 +322,157 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
     }
   };
 
+  const handleDownloadAttachment = async (attId: number, originalName: string) => {
+    setError(null);
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`/api/attachments/${attId}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || 'No se pudo descargar el adjunto');
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = originalName || `adjunto-${attId}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    }
+  };
+
   const incompleteItems = detail
     ? detail.items
         .map((it) => {
-          const entry = inputs[it.id] || { bulkQty: '', looseQty: '', obs: '' };
+          const entry = inputs[it.id] || {
+            bulkQty: '',
+            looseQty: '',
+            isNotCounted: false,
+            notCountedReason: '',
+            obs: '',
+          };
+          if (entry.isNotCounted) {
+            return {
+              id: it.id,
+              sku: it.sku,
+              missingBulk: false,
+              missingLoose: false,
+              missingReason: entry.notCountedReason.trim() === '',
+            };
+          }
           const missingBulk = !isValidRequiredQty(entry.bulkQty);
           const missingLoose = !isValidRequiredQty(entry.looseQty);
-          return { id: it.id, sku: it.sku, missingBulk, missingLoose };
+          return {
+            id: it.id,
+            sku: it.sku,
+            missingBulk,
+            missingLoose,
+            missingReason: false,
+          };
         })
-        .filter((x) => x.missingBulk || x.missingLoose)
+        .filter((x) => x.missingBulk || x.missingLoose || x.missingReason)
     : [];
 
-  const handleSaveOrSubmit = async (submitForReview: boolean) => {
+  const totalAttachmentsCount = detail
+    ? (detail.sheetAttachments?.length || 0) +
+      detail.items.reduce((sum, it) => sum + (it.attachments?.length || 0), 0)
+    : 0;
+
+  const hasWarehouseSignature = Boolean(
+    detail && String(detail.count.warehouse_signature_name || '').trim()
+  );
+  const hasCounterSignature = counterSig.trim().length > 0;
+  const hasGeneralObservations = generalObservations.trim().length > 0;
+  const isExecutionStageForPresent = Boolean(
+    detail &&
+      (detail.count.status === CountStatus.EN_EJECUCION ||
+        detail.count.status === CountStatus.RECHAZADO)
+  );
+
+  const handleSaveOrPresent = async (presentForApproval: boolean) => {
     if (!detail) return;
     setError(null);
     setMessage(null);
 
-    if (submitForReview && incompleteItems.length > 0) {
+    if (presentForApproval) {
       setValidationAttempted(true);
-      const previewSkus = incompleteItems
-        .slice(0, 4)
-        .map((x) => {
-          const cols = [
-            x.missingBulk ? 'Unidades/Bultos' : '',
-            x.missingLoose ? 'Unidades Sueltas' : '',
-          ]
-            .filter(Boolean)
-            .join(' y ');
-          return `${x.sku} (${cols})`;
-        })
-        .join(', ');
-      setError(
-        `No se puede enviar el registro: debe completar tanto "Unidades / Bultos" como "Unidades Sueltas" en todos los artículos. Pendientes (${incompleteItems.length}): ${previewSkus}${
-          incompleteItems.length > 4 ? '...' : ''
-        }.`
-      );
-      return;
+      if (!isExecutionStageForPresent) {
+        setError(
+          'Debe iniciar primero la ejecución del conteo (botón "Iniciar Conteo") antes de presentarlo para revisión.'
+        );
+        return;
+      }
+      if (incompleteItems.length > 0) {
+        const previewSkus = incompleteItems
+          .slice(0, 4)
+          .map((x) => {
+            if (x.missingReason) return `${x.sku} (Justificación de no conteo)`;
+            const cols = [
+              x.missingBulk ? 'Unidades/Bultos' : '',
+              x.missingLoose ? 'Unidades Sueltas' : '',
+            ]
+              .filter(Boolean)
+              .join(' y ');
+            return `${x.sku} (${cols})`;
+          })
+          .join(', ');
+        setError(
+          `No se puede presentar el conteo: todos los artículos deben tener resultado físico completo o justificación de no conteo. Pendientes (${incompleteItems.length}): ${previewSkus}${
+            incompleteItems.length > 4 ? '...' : ''
+          }.`
+        );
+        return;
+      }
+      if (!hasCounterSignature) {
+        setError('Debe ingresar la firma o responsabilidad digital del contador.');
+        return;
+      }
+      if (!hasWarehouseSignature) {
+        setError(
+          'Falta la firma/conformidad del Responsable de Depósito antes de presentar el conteo.'
+        );
+        return;
+      }
+      if (!hasGeneralObservations) {
+        setError('Debe completar las observaciones generales obligatorias del conteo.');
+        return;
+      }
+      if (totalAttachmentsCount === 0) {
+        setError(
+          'Debe adjuntar al menos una planilla firmada o documento respaldatorio antes de presentar el conteo.'
+        );
+        return;
+      }
     }
 
-    // Check for negative or invalid numbers even when saving a draft
+    // Validate numeric inputs when provided on non-skipped items
     for (const it of detail.items) {
-      const entry = inputs[it.id] || { bulkQty: '', looseQty: '', obs: '' };
+      const entry = inputs[it.id] || {
+        bulkQty: '',
+        looseQty: '',
+        isNotCounted: false,
+        notCountedReason: '',
+        obs: '',
+      };
+      if (entry.isNotCounted) continue;
       if (entry.bulkQty.trim() !== '' && !isValidRequiredQty(entry.bulkQty)) {
         setValidationAttempted(true);
-        setError(`El valor de "Unidades / Bultos" en ${it.sku} debe ser un número válido mayor o igual a 0.`);
+        setError(
+          `El valor de "Unidades / Bultos" en ${it.sku} debe ser un número válido mayor o igual a 0.`
+        );
         return;
       }
       if (entry.looseQty.trim() !== '' && !isValidRequiredQty(entry.looseQty)) {
         setValidationAttempted(true);
-        setError(`El valor de "Unidades Sueltas" en ${it.sku} debe ser un número válido mayor o igual a 0.`);
+        setError(
+          `El valor de "Unidades Sueltas" en ${it.sku} debe ser un número válido mayor o igual a 0.`
+        );
         return;
       }
     }
@@ -310,13 +480,32 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
     setSaving(true);
     try {
       const payloadItems = detail.items.map((it) => {
-        const entry = inputs[it.id] || { bulkQty: '', looseQty: '', obs: '' };
+        const entry = inputs[it.id] || {
+          bulkQty: '',
+          looseQty: '',
+          isNotCounted: false,
+          notCountedReason: '',
+          obs: '',
+        };
+        if (entry.isNotCounted) {
+          return {
+            itemId: it.id,
+            isNotCounted: true,
+            notCountedReason: entry.notCountedReason.trim(),
+            bulkQty: null,
+            looseQty: null,
+            countedQty: null,
+            observations: entry.obs ?? '',
+          };
+        }
         const bulk = entry.bulkQty.trim() === '' ? null : Number(entry.bulkQty);
         const loose = entry.looseQty.trim() === '' ? null : Number(entry.looseQty);
         const countedQty =
           bulk !== null && loose !== null ? Math.round((bulk + loose) * 10000) / 10000 : null;
         return {
           itemId: it.id,
+          isNotCounted: false,
+          notCountedReason: '',
           bulkQty: bulk,
           looseQty: loose,
           countedQty,
@@ -324,22 +513,27 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
         };
       });
 
-      await apiFetch(`/api/counts/${detail.count.id}/submit-results`, {
+      const endpoint = presentForApproval
+        ? `/api/counts/${detail.count.id}/present`
+        : `/api/counts/${detail.count.id}/submit-results`;
+
+      await apiFetch(endpoint, {
         method: 'POST',
         body: JSON.stringify({
           items: payloadItems,
-          counterSignatureName: counterSig,
-          submitForReview,
+          counterSignatureName: counterSig.trim(),
+          generalObservations: generalObservations.trim(),
+          submitForReview: presentForApproval,
         }),
       });
 
       setValidationAttempted(false);
       setMessage(
-        submitForReview
-          ? 'Conteo enviado para revisión y conciliación automática ejecutada.'
+        presentForApproval
+          ? 'Conteo presentado para revisión y enviado al Jefe de Control de Stock.'
           : 'Borrador guardado correctamente.'
       );
-      await loadCounts();
+      await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
@@ -357,7 +551,7 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
         body: JSON.stringify({ signatureName: whSig, notes: whNotes }),
       });
       setMessage('Conformidad y firma del Responsable de Depósito registradas.');
-      await loadCounts();
+      await loadCounts(Number(detail.count.id));
     } catch (err: unknown) {
       setError((err as Error).message);
     }
@@ -366,18 +560,22 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
   const canCounterEdit =
     detail &&
     (currentUser.role === UserRole.CONTADOR || currentUser.role === UserRole.JEFE_STOCK) &&
-    [CountStatus.PROGRAMADO, CountStatus.EN_PROGRESO, CountStatus.RECONTEO_SOLICITADO].includes(
-      detail.count.status as CountStatus
-    );
+    ([
+      CountStatus.ASIGNADO,
+      CountStatus.EN_EJECUCION,
+      CountStatus.RECHAZADO,
+    ] as CountStatus[]).includes(detail.count.status as CountStatus);
+
+  const detailMeta = detail ? getCountStatusMeta(String(detail.count.status)) : null;
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-slate-900">
-          Ejecución de Conteos Ciegos y Conciliación
+          Ejecución de Conteos Ciegos y Presentación
         </h2>
         <p className="text-sm text-slate-600 mt-0.5">
-          Planillas ciegas imprimibles en PDF, carga manual o Excel, evidencia fotográfica y conciliación automática con alertas históricas.
+          Planillas ciegas imprimibles en PDF, carga manual o Excel, justificación de no conteo, documentación respaldatoria y presentación formal para aprobación.
         </p>
       </div>
 
@@ -397,34 +595,43 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
         {/* Left List */}
         <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
           <div className="px-4 py-3 border-b border-slate-200 text-xs font-bold text-slate-900">
-            Conteos Asignados ({counts.length})
+            Conteos Disponibles ({counts.length})
           </div>
           {loading ? (
             <div className="p-6 text-xs text-slate-500 text-center">Cargando...</div>
           ) : counts.length === 0 ? (
             <div className="p-6 text-xs text-slate-500 text-center">
-              No hay conteos programados para su perfil.
+              No hay conteos asignados para su perfil.
             </div>
           ) : (
-            <div className="divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
-              {counts.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => openCount(c.id)}
-                  className={`w-full text-left p-3.5 transition-colors hover:bg-slate-50 ${
-                    selectedId === c.id ? 'bg-blue-50/70' : ''
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    <span className="font-mono font-bold text-slate-900">{c.count_number}</span>
-                    <span className="font-medium text-slate-700">{c.status}</span>
-                  </div>
-                  <div className="text-xs font-medium text-slate-800 mt-1">{c.location_name}</div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    {c.scheduled_date} · {c.counter_name} · {c.counted_items_count}/{c.items_count} ítems
-                  </div>
-                </button>
-              ))}
+            <div className="divide-y divide-slate-100 max-h-[640px] overflow-y-auto">
+              {counts.map((c) => {
+                const meta = getCountStatusMeta(c.status);
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => openCount(c.id)}
+                    className={`w-full text-left p-3.5 transition-colors hover:bg-slate-50 ${
+                      selectedId === c.id ? 'bg-blue-50/70' : ''
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="font-mono font-bold text-slate-900">{c.count_number}</span>
+                      <span
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium border rounded ${meta.surfaceClass} ${meta.textClass}`}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${meta.dotClass}`} />
+                        {meta.shortLabel}
+                      </span>
+                    </div>
+                    <div className="text-xs font-medium text-slate-800 mt-1">{c.location_name}</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                      {c.scheduled_date} · {c.counter_name || 'Sin asignar'} ·{' '}
+                      {c.counted_items_count}/{c.items_count} ítems
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -434,7 +641,7 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
           {!detail ? (
             <div className="py-16 text-center text-sm text-slate-500">
               <ClipboardCheck className="w-8 h-8 text-slate-400 mx-auto mb-2" />
-              Seleccione un conteo de la lista para imprimir su planilla ciega, cargar cantidades o revisar la conciliación.
+              Seleccione un conteo de la lista para imprimir su planilla ciega, iniciar ejecución, cargar cantidades o presentarlo a aprobación.
             </div>
           ) : (
             <>
@@ -447,33 +654,68 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                     className="w-11 h-11 rounded-lg object-cover border border-slate-200 shrink-0"
                   />
                   <div>
-                    <div className="text-xs font-mono text-slate-500">
-                      MercoMat · {String(detail.count.count_number)} · ID{' '}
-                      {String(detail.count.document_uid)} · {String(detail.count.status)}
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-slate-500">
+                      <span>
+                        MercoMat · {String(detail.count.count_number)} · ID{' '}
+                        {String(detail.count.document_uid)}
+                      </span>
+                      {detailMeta && (
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 font-sans text-[11px] font-medium border rounded ${detailMeta.surfaceClass} ${detailMeta.textClass}`}
+                        >
+                          <span className={`w-1.5 h-1.5 rounded-full ${detailMeta.dotClass}`} />
+                          {detailMeta.label}
+                        </span>
+                      )}
                     </div>
                     <h3 className="text-lg font-bold text-slate-900 mt-0.5">
                       {String(detail.count.location_name)}
                     </h3>
                     <div className="text-xs text-slate-600 mt-0.5">
-                      Fecha: <span className="font-mono">{String(detail.count.scheduled_date)}</span> ·
-                      Contador: {String(detail.count.counter_name)}
+                      Fecha programada:{' '}
+                      <span className="font-mono">{String(detail.count.scheduled_date)}</span> ·
+                      Contador: {String(detail.count.counter_name || 'Sin asignar')}
+                      {Boolean(detail.count.blind_printed_at) && (
+                        <>
+                          {' '}
+                          ·{' '}
+                          <span className="text-emerald-700 font-medium">
+                            Planilla validada ({String(detail.count.blind_printed_at).slice(0, 16)})
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  {detail.count.status === CountStatus.ASIGNADO &&
+                    (currentUser.role === UserRole.CONTADOR ||
+                      currentUser.role === UserRole.JEFE_STOCK) && (
+                      <button
+                        type="button"
+                        onClick={handleStartCount}
+                        disabled={saving}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-indigo-700 text-white rounded-lg hover:bg-indigo-800 whitespace-nowrap"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        Iniciar Conteo
+                      </button>
+                    )}
+
                   <button
+                    type="button"
                     onClick={handlePrintBlindPdf}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909]"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] whitespace-nowrap"
                   >
                     <Printer className="w-3.5 h-3.5" />
                     Imprimir Planilla Ciega (PDF)
                   </button>
 
                   {canCounterEdit && (
-                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 cursor-pointer">
+                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 cursor-pointer whitespace-nowrap">
                       <FileSpreadsheet className="w-3.5 h-3.5" />
-                      Importar Excel Resultados
+                      Importar Excel
                       <input
                         type="file"
                         accept=".xlsx,.xls,.csv"
@@ -485,11 +727,31 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                 </div>
               </div>
 
+              {detail.count.status === CountStatus.RECHAZADO && (
+                <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-900 space-y-1.5">
+                  <div className="font-bold flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-red-700 shrink-0" />
+                    Conteo Rechazado por Control de Stock — Requiere corrección y nueva presentación
+                  </div>
+                  <div>
+                    <strong>Motivo del rechazo:</strong>{' '}
+                    {String(detail.count.rejection_reason || detail.count.chief_notes || 'Sin especificar')}
+                  </div>
+                  {detail.submissions.length > 0 && (
+                    <div className="text-[11px] text-red-800">
+                      Versión anterior conservada en historial: v{detail.submissions[0].version_number} (
+                      {detail.submissions[0].created_at.slice(0, 16)}). Corrija los datos y vuelva a
+                      presentar como v{detail.submissions[0].version_number + 1}.
+                    </div>
+                  )}
+                </div>
+              )}
+
               {detail.isBlindRestricted && (
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700 flex items-center gap-2">
                   <ShieldAlert className="w-4 h-4 text-blue-700 shrink-0" />
                   <span>
-                    <strong>Modo Conteo Ciego Activo:</strong> Las existencias teóricas del ERP y posibles diferencias permanecen ocultas hasta completar y enviar el relevamiento físico.
+                    <strong>Modo Conteo Ciego Activo:</strong> Las existencias teóricas del ERP y posibles diferencias permanecen ocultas hasta presentar el relevamiento físico para aprobación.
                   </span>
                 </div>
               )}
@@ -527,9 +789,7 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                         Unidades Sueltas <span className="text-red-600">*</span>
                       </th>
                       <th className="py-2 px-2.5 text-right whitespace-nowrap">
-                        {detail.count.status === CountStatus.RECONTEO_SOLICITADO
-                          ? 'Total R2'
-                          : 'Total Físico'}
+                        {detail.count.status === CountStatus.RECHAZADO ? 'Total Corregido' : 'Total Físico'}
                       </th>
                       {!detail.isBlindRestricted && (
                         <>
@@ -537,186 +797,283 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                           <th className="py-2 px-2.5">Resultado</th>
                         </>
                       )}
-                      <th className="py-2 px-2.5">Observaciones / Foto</th>
+                      <th className="py-2 px-2.5">Observaciones / Estado / Foto</th>
                     </tr>
                   </thead>
                   <tbody>
                     {detail.items.map((it) => {
-                      const entry = inputs[it.id] || { bulkQty: '', looseQty: '', obs: '' };
-                      const bulkValid = isValidRequiredQty(entry.bulkQty);
-                      const looseValid = isValidRequiredQty(entry.looseQty);
-                      const rowTotal =
-                        bulkValid && looseValid
+                      const entry = inputs[it.id] || {
+                        bulkQty: '',
+                        looseQty: '',
+                        isNotCounted: false,
+                        notCountedReason: '',
+                        obs: '',
+                      };
+                      const bulkValid = entry.isNotCounted || isValidRequiredQty(entry.bulkQty);
+                      const looseValid = entry.isNotCounted || isValidRequiredQty(entry.looseQty);
+                      const reasonValid =
+                        !entry.isNotCounted || entry.notCountedReason.trim().length > 0;
+                      const rowTotal = entry.isNotCounted
+                        ? null
+                        : bulkValid && looseValid
                           ? Math.round((Number(entry.bulkQty) + Number(entry.looseQty)) * 10000) /
                             10000
                           : null;
-                      const isRecount = detail.count.status === CountStatus.RECONTEO_SOLICITADO;
+                      const isRecount = detail.count.status === CountStatus.RECHAZADO;
                       const displayBulk = isRecount ? it.recount_bulk_qty : it.bulk_qty;
                       const displayLoose = isRecount ? it.recount_loose_qty : it.loose_qty;
 
                       return (
                         <React.Fragment key={it.id}>
-                          <tr className="border-b border-slate-100">
-                            <td className="py-2 px-2.5 font-mono font-semibold text-slate-900">
+                          <tr
+                            className={`border-b border-slate-100 ${
+                              entry.isNotCounted ? 'bg-slate-50/80' : ''
+                            }`}
+                          >
+                            <td className="py-2 px-2.5 font-mono font-semibold text-slate-900 align-top">
                               {it.sku}
                             </td>
-                            <td className="py-2 px-2.5">
+                            <td className="py-2 px-2.5 align-top">
                               <div className="font-medium text-slate-900">{it.description}</div>
                               <div className="text-[11px] text-slate-500">{it.unit_of_measure}</div>
                               {it.recount_requested_reason && (
-                                <div className="text-[11px] text-amber-700 mt-0.5">
-                                  Motivo reconteo: {it.recount_requested_reason}
+                                <div className="text-[11px] text-red-700 mt-0.5 font-medium">
+                                  Motivo corrección: {it.recount_requested_reason}
                                 </div>
                               )}
                             </td>
                             {!detail.isBlindRestricted && (
                               <>
-                                <td className="py-2 px-2.5 text-right font-mono tabular-nums">
+                                <td className="py-2 px-2.5 text-right font-mono tabular-nums align-top">
                                   {it.snapshot_erp_stock}
                                 </td>
-                                <td className="py-2 px-2.5 text-right font-mono tabular-nums text-slate-500">
+                                <td className="py-2 px-2.5 text-right font-mono tabular-nums text-slate-500 align-top">
                                   {it.snapshot_committed_stock}
                                 </td>
                               </>
                             )}
                             <td className="py-2 px-2.5 text-right align-top">
                               {canCounterEdit ? (
-                                <div className="inline-flex flex-col items-end">
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    step="any"
-                                    required
-                                    aria-label={`Unidades / Bultos para ${it.sku}`}
-                                    aria-invalid={!bulkValid}
-                                    value={entry.bulkQty}
-                                    onChange={(e) =>
-                                      setInputs({
-                                        ...inputs,
-                                        [it.id]: {
-                                          ...entry,
-                                          bulkQty: e.target.value,
-                                        },
-                                      })
-                                    }
-                                    placeholder="0"
-                                    className={`w-24 px-2 py-1 text-right font-mono border rounded ${
-                                      !bulkValid
-                                        ? validationAttempted
-                                          ? 'border-red-500 bg-red-50/70 text-red-900'
-                                          : 'border-amber-400 bg-amber-50/30'
-                                        : 'border-slate-300 bg-white'
-                                    }`}
-                                  />
-                                  {validationAttempted && !bulkValid && (
-                                    <span className="text-[10px] text-red-600 mt-0.5">
-                                      Requerido
-                                    </span>
-                                  )}
-                                </div>
+                                entry.isNotCounted ? (
+                                  <span className="text-[11px] font-medium text-slate-500 italic">
+                                    No contado
+                                  </span>
+                                ) : (
+                                  <div className="inline-flex flex-col items-end">
+                                    <input
+                                      type="number"
+                                      min={0}
+                                      step="any"
+                                      required
+                                      aria-label={`Unidades / Bultos para ${it.sku}`}
+                                      aria-invalid={!bulkValid}
+                                      value={entry.bulkQty}
+                                      onChange={(e) =>
+                                        setInputs({
+                                          ...inputs,
+                                          [it.id]: {
+                                            ...entry,
+                                            bulkQty: e.target.value,
+                                          },
+                                        })
+                                      }
+                                      placeholder="0"
+                                      className={`w-24 px-2 py-1 text-right font-mono border rounded ${
+                                        !bulkValid
+                                          ? validationAttempted
+                                            ? 'border-red-500 bg-red-50/70 text-red-900'
+                                            : 'border-amber-400 bg-amber-50/30'
+                                          : 'border-slate-300 bg-white'
+                                      }`}
+                                    />
+                                    {validationAttempted && !bulkValid && (
+                                      <span className="text-[10px] text-red-600 mt-0.5">
+                                        Requerido
+                                      </span>
+                                    )}
+                                  </div>
+                                )
                               ) : (
                                 <span className="font-mono tabular-nums text-slate-700">
-                                  {displayBulk ?? '—'}
+                                  {Number(it.is_not_counted || 0) === 1
+                                    ? 'No contado'
+                                    : (displayBulk ?? '—')}
                                 </span>
                               )}
                             </td>
                             <td className="py-2 px-2.5 text-right align-top">
                               {canCounterEdit ? (
-                                <div className="inline-flex flex-col items-end">
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    step="any"
-                                    required
-                                    aria-label={`Unidades Sueltas para ${it.sku}`}
-                                    aria-invalid={!looseValid}
-                                    value={entry.looseQty}
-                                    onChange={(e) =>
-                                      setInputs({
-                                        ...inputs,
-                                        [it.id]: {
-                                          ...entry,
-                                          looseQty: e.target.value,
-                                        },
-                                      })
-                                    }
-                                    placeholder="0"
-                                    className={`w-24 px-2 py-1 text-right font-mono border rounded ${
-                                      !looseValid
-                                        ? validationAttempted
-                                          ? 'border-red-500 bg-red-50/70 text-red-900'
-                                          : 'border-amber-400 bg-amber-50/30'
-                                        : 'border-slate-300 bg-white'
-                                    }`}
-                                  />
-                                  {validationAttempted && !looseValid && (
-                                    <span className="text-[10px] text-red-600 mt-0.5">
-                                      Requerido
-                                    </span>
-                                  )}
-                                </div>
+                                entry.isNotCounted ? (
+                                  <span className="text-[11px] text-slate-400">—</span>
+                                ) : (
+                                  <div className="inline-flex flex-col items-end">
+                                    <input
+                                      type="number"
+                                      min={0}
+                                      step="any"
+                                      required
+                                      aria-label={`Unidades Sueltas para ${it.sku}`}
+                                      aria-invalid={!looseValid}
+                                      value={entry.looseQty}
+                                      onChange={(e) =>
+                                        setInputs({
+                                          ...inputs,
+                                          [it.id]: {
+                                            ...entry,
+                                            looseQty: e.target.value,
+                                          },
+                                        })
+                                      }
+                                      placeholder="0"
+                                      className={`w-24 px-2 py-1 text-right font-mono border rounded ${
+                                        !looseValid
+                                          ? validationAttempted
+                                            ? 'border-red-500 bg-red-50/70 text-red-900'
+                                            : 'border-amber-400 bg-amber-50/30'
+                                          : 'border-slate-300 bg-white'
+                                      }`}
+                                    />
+                                    {validationAttempted && !looseValid && (
+                                      <span className="text-[10px] text-red-600 mt-0.5">
+                                        Requerido
+                                      </span>
+                                    )}
+                                  </div>
+                                )
                               ) : (
                                 <span className="font-mono tabular-nums text-slate-700">
-                                  {displayLoose ?? '—'}
+                                  {Number(it.is_not_counted || 0) === 1
+                                    ? '—'
+                                    : (displayLoose ?? '—')}
                                 </span>
                               )}
                             </td>
-                            <td className="py-2 px-2.5 text-right">
+                            <td className="py-2 px-2.5 text-right align-top">
                               {canCounterEdit ? (
-                                <span
-                                  className={`font-mono font-semibold tabular-nums ${
-                                    rowTotal !== null ? 'text-slate-900' : 'text-amber-700 text-[11px]'
-                                  }`}
-                                >
-                                  {rowTotal !== null ? rowTotal : 'Incompleto'}
-                                </span>
+                                entry.isNotCounted ? (
+                                  <span className="text-[11px] font-medium text-amber-800">
+                                    Justificado
+                                  </span>
+                                ) : (
+                                  <span
+                                    className={`font-mono font-semibold tabular-nums ${
+                                      rowTotal !== null
+                                        ? 'text-slate-900'
+                                        : 'text-amber-700 text-[11px]'
+                                    }`}
+                                  >
+                                    {rowTotal !== null ? rowTotal : 'Incompleto'}
+                                  </span>
+                                )
                               ) : (
                                 <span className="font-mono font-semibold tabular-nums">
-                                  {it.final_counted_qty ?? '—'}
+                                  {Number(it.is_not_counted || 0) === 1
+                                    ? 'No contado'
+                                    : (it.final_counted_qty ?? '—')}
                                 </span>
                               )}
                             </td>
                             {!detail.isBlindRestricted && (
                               <>
                                 <td
-                                  className={`py-2 px-2.5 text-right font-mono font-bold tabular-nums ${
-                                    (it.difference || 0) < 0
-                                      ? 'text-red-700'
-                                      : (it.difference || 0) > 0
-                                        ? 'text-amber-700'
-                                        : 'text-emerald-700'
+                                  className={`py-2 px-2.5 text-right font-mono font-bold tabular-nums align-top ${
+                                    Number(it.is_not_counted || 0) === 1
+                                      ? 'text-slate-500'
+                                      : (it.difference || 0) < 0
+                                        ? 'text-red-700'
+                                        : (it.difference || 0) > 0
+                                          ? 'text-amber-700'
+                                          : 'text-emerald-700'
                                   }`}
                                 >
-                                  {it.difference !== null
-                                    ? `${it.difference > 0 ? '+' : ''}${it.difference}`
-                                    : '—'}
+                                  {Number(it.is_not_counted || 0) === 1
+                                    ? 'N/C'
+                                    : it.difference !== null
+                                      ? `${it.difference > 0 ? '+' : ''}${it.difference}`
+                                      : '—'}
                                 </td>
-                                <td className="py-2 px-2.5 font-medium">
-                                  {it.reconciliation_result || 'Pendiente'}
+                                <td className="py-2 px-2.5 font-medium align-top">
+                                  {Number(it.is_not_counted || 0) === 1
+                                    ? 'NO CONTADO'
+                                    : it.reconciliation_result || 'Pendiente'}
                                 </td>
                               </>
                             )}
-                            <td className="py-2 px-2.5 space-y-1">
+                            <td className="py-2 px-2.5 space-y-1.5 align-top min-w-[200px]">
                               {canCounterEdit ? (
-                                <input
-                                  type="text"
-                                  value={entry.obs}
-                                  onChange={(e) =>
-                                    setInputs({
-                                      ...inputs,
-                                      [it.id]: {
-                                        ...entry,
-                                        obs: e.target.value,
-                                      },
-                                    })
-                                  }
-                                  placeholder="Obs..."
-                                  className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
-                                />
+                                <>
+                                  <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-700 cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={entry.isNotCounted}
+                                      onChange={(e) =>
+                                        setInputs({
+                                          ...inputs,
+                                          [it.id]: {
+                                            ...entry,
+                                            isNotCounted: e.target.checked,
+                                          },
+                                        })
+                                      }
+                                      className="rounded border-slate-300"
+                                    />
+                                    Marcar como No contado
+                                  </label>
+
+                                  {entry.isNotCounted && (
+                                    <div>
+                                      <input
+                                        type="text"
+                                        value={entry.notCountedReason}
+                                        onChange={(e) =>
+                                          setInputs({
+                                            ...inputs,
+                                            [it.id]: {
+                                              ...entry,
+                                              notCountedReason: e.target.value,
+                                            },
+                                          })
+                                        }
+                                        placeholder="Motivo obligatorio de no conteo *"
+                                        className={`w-full px-2 py-1 border rounded text-xs ${
+                                          !reasonValid && validationAttempted
+                                            ? 'border-red-500 bg-red-50/70'
+                                            : 'border-amber-400 bg-amber-50/40'
+                                        }`}
+                                      />
+                                      {validationAttempted && !reasonValid && (
+                                        <span className="text-[10px] text-red-600 block mt-0.5">
+                                          Justificación requerida
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  <input
+                                    type="text"
+                                    value={entry.obs}
+                                    onChange={(e) =>
+                                      setInputs({
+                                        ...inputs,
+                                        [it.id]: {
+                                          ...entry,
+                                          obs: e.target.value,
+                                        },
+                                      })
+                                    }
+                                    placeholder="Obs. del ítem..."
+                                    className="w-full px-2 py-1 border border-slate-300 rounded text-xs"
+                                  />
+                                </>
                               ) : (
-                                <span className="text-slate-600">
-                                  {it.counter_observations || '—'}
-                                </span>
+                                <div className="space-y-0.5 text-slate-600">
+                                  {Number(it.is_not_counted || 0) === 1 && (
+                                    <div className="text-[11px] text-amber-800 font-medium">
+                                      Justificación: {it.not_counted_reason || '—'}
+                                    </div>
+                                  )}
+                                  <div>{it.counter_observations || '—'}</div>
+                                </div>
                               )}
                               <div className="flex flex-wrap items-center gap-2">
                                 {canCounterEdit && (
@@ -735,13 +1092,18 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                                   </label>
                                 )}
                                 {it.attachments.map((att) => (
-                                  <span
+                                  <button
                                     key={att.id}
-                                    className="inline-flex items-center gap-1 text-[11px] text-slate-600"
+                                    type="button"
+                                    onClick={() =>
+                                      handleDownloadAttachment(att.id, att.original_name)
+                                    }
+                                    className="inline-flex items-center gap-1 text-[11px] text-slate-700 hover:text-[#8e0d0d] hover:underline"
+                                    title="Descargar adjunto"
                                   >
                                     <Paperclip className="w-3 h-3" />
                                     {att.original_name}
-                                  </span>
+                                  </button>
                                 ))}
                               </div>
                             </td>
@@ -766,72 +1128,146 @@ export const CountsWorkspaceView: React.FC<{ currentUser: AuthUser }> = ({ curre
                 </table>
               </div>
 
-              {/* Counter submission actions */}
-              {canCounterEdit && (
-                <div className="pt-4 border-t border-slate-200 space-y-3">
-                  {incompleteItems.length > 0 && (
-                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-start gap-2">
-                      <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                      <div>
-                        <span className="font-semibold">
-                          Validación obligatoria para enviar:
-                        </span>{' '}
-                        Complete tanto <strong>Unidades / Bultos</strong> como{' '}
-                        <strong>Unidades Sueltas</strong> en todos los artículos (ingrese{' '}
-                        <span className="font-mono font-semibold">0</span> si no hay existencias en
-                        esa columna). Faltan{' '}
-                        <strong className="tabular-nums">{incompleteItems.length}</strong>{' '}
-                        artículo(s):{' '}
-                        <span className="font-mono">
-                          {incompleteItems
-                            .slice(0, 5)
-                            .map((x) => x.sku)
-                            .join(', ')}
-                          {incompleteItems.length > 5 ? '...' : ''}
-                        </span>
-                        .
-                      </div>
+              {/* Count-level Supporting Documentation */}
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="font-bold text-slate-900">
+                      Planilla Firmada / Documentación Respaldatoria ({totalAttachmentsCount} adjunto(s))
                     </div>
-                  )}
-
-                  <div className="flex flex-wrap items-end justify-between gap-4">
-                    <div className="w-full sm:w-64">
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Firma Digital Responsable de Conteo
-                      </label>
-                      <input
-                        type="text"
-                        value={counterSig}
-                        onChange={(e) => setCounterSig(e.target.value)}
-                        className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleSaveOrSubmit(false)}
-                        disabled={saving}
-                        className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap"
-                      >
-                        <Save className="w-3.5 h-3.5" />
-                        Guardar Borrador
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleSaveOrSubmit(true)}
-                        disabled={saving || incompleteItems.length > 0}
-                        title={
-                          incompleteItems.length > 0
-                            ? 'Complete Unidades / Bultos y Unidades Sueltas en todos los artículos para habilitar el envío'
-                            : 'Enviar conteo para revisión'
-                        }
-                        className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
-                      >
-                        <Send className="w-3.5 h-3.5" />
-                        Enviar Conteo para Revisión
-                      </button>
+                    <div className="text-[11px] text-slate-500">
+                      Requerido al menos 1 documento respaldatorio (planilla escaneada/foto o evidencia por ítem) para presentar el conteo.
                     </div>
                   </div>
+                  {canCounterEdit && (
+                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-100 font-medium text-slate-800 whitespace-nowrap">
+                      <Upload className="w-3.5 h-3.5" />
+                      Subir Planilla Firmada / Archivo
+                      <input
+                        type="file"
+                        accept="image/*,.pdf"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) handleUploadAttachment('COUNT_SHEET', Number(detail.count.id), f);
+                        }}
+                        className="hidden"
+                      />
+                    </label>
+                  )}
+                </div>
+                {detail.sheetAttachments.length > 0 && (
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {detail.sheetAttachments.map((att) => (
+                      <button
+                        key={att.id}
+                        type="button"
+                        onClick={() => handleDownloadAttachment(att.id, att.original_name)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-slate-200 rounded text-[11px] font-medium text-slate-700 hover:border-[#8e0d0d] hover:text-[#8e0d0d]"
+                      >
+                        <Download className="w-3 h-3" />
+                        {att.original_name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Counter submission / presentation panel */}
+              {canCounterEdit && (
+                <div className="pt-4 border-t border-slate-200 space-y-4">
+                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
+                    <div className="font-bold text-slate-900">
+                      Checklist para Presentación Formal a Revisión
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px]">
+                      <div className={isExecutionStageForPresent ? 'text-emerald-700' : 'text-amber-700'}>
+                        {isExecutionStageForPresent ? '✓' : '○'} Conteo iniciado en ejecución (
+                        {isExecutionStageForPresent ? 'Listo' : 'Hacer clic en Iniciar Conteo'})
+                      </div>
+                      <div className={incompleteItems.length === 0 ? 'text-emerald-700' : 'text-amber-700'}>
+                        {incompleteItems.length === 0 ? '✓' : '○'} Artículos completos o justificados (
+                        {detail.items.length - incompleteItems.length}/{detail.items.length})
+                      </div>
+                      <div className={hasCounterSignature ? 'text-emerald-700' : 'text-amber-700'}>
+                        {hasCounterSignature ? '✓' : '○'} Firma digital del responsable de conteo
+                      </div>
+                      <div className={hasWarehouseSignature ? 'text-emerald-700' : 'text-amber-700'}>
+                        {hasWarehouseSignature ? '✓' : '○'} Conformidad del Responsable de Depósito
+                      </div>
+                      <div className={hasGeneralObservations ? 'text-emerald-700' : 'text-amber-700'}>
+                        {hasGeneralObservations ? '✓' : '○'} Observaciones generales del conteo
+                      </div>
+                      <div className={totalAttachmentsCount > 0 ? 'text-emerald-700' : 'text-amber-700'}>
+                        {totalAttachmentsCount > 0 ? '✓' : '○'} Documentación respaldatoria adjunta (
+                        {totalAttachmentsCount})
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        Observaciones Generales del Conteo <span className="text-red-600">*</span>
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={generalObservations}
+                        onChange={(e) => setGeneralObservations(e.target.value)}
+                        placeholder="Detalle condiciones del depósito, hallazgos relevantes, orden de estanterías o incidencias..."
+                        className={`w-full px-3 py-2 text-xs border rounded-lg ${
+                          validationAttempted && !hasGeneralObservations
+                            ? 'border-red-500 bg-red-50/60'
+                            : 'border-slate-300 bg-white'
+                        }`}
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-end justify-between gap-4">
+                      <div className="w-full sm:w-64">
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          Firma Digital Responsable de Conteo <span className="text-red-600">*</span>
+                        </label>
+                        <input
+                          type="text"
+                          value={counterSig}
+                          onChange={(e) => setCounterSig(e.target.value)}
+                          className={`w-full px-3 py-1.5 text-xs border rounded-lg ${
+                            validationAttempted && !hasCounterSignature
+                              ? 'border-red-500 bg-red-50/60'
+                              : 'border-slate-300 bg-white'
+                          }`}
+                        />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleSaveOrPresent(false)}
+                          disabled={saving}
+                          className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap"
+                        >
+                          <Save className="w-3.5 h-3.5" />
+                          Guardar Borrador
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleSaveOrPresent(true)}
+                          disabled={saving}
+                          className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] disabled:opacity-50 whitespace-nowrap"
+                        >
+                          <Send className="w-3.5 h-3.5" />
+                          PRESENTAR CONTEO PARA REVISIÓN
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Read-only summary banner when already presented/approved/closed */}
+              {!canCounterEdit && String(detail.count.counter_general_notes || '').trim() !== '' && (
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700">
+                  <span className="font-semibold text-slate-900">Observaciones del contador:</span>{' '}
+                  {String(detail.count.counter_general_notes)}
                 </div>
               )}
 

@@ -6,6 +6,7 @@ import {
   FileSpreadsheet,
   History,
   Search,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react';
@@ -86,6 +87,18 @@ interface ValidationPreview {
   }>;
 }
 
+interface ImportBatch {
+  id: number;
+  filename: string;
+  cutoff_timestamp: string;
+  uploaded_by_name: string;
+  total_rows: number;
+  inserted_products: number;
+  updated_balances: number;
+  warnings_count: number;
+  created_at: string;
+}
+
 export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ currentUser }) => {
   const [viewMode, setViewMode] = useState<'by_location' | 'consolidated' | 'batches'>('by_location');
   const [search, setSearch] = useState('');
@@ -93,8 +106,11 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
   const [locations, setLocations] = useState<Array<{ id: number; name: string }>>([]);
   const [items, setItems] = useState<BalanceItem[]>([]);
   const [consolidated, setConsolidated] = useState<ConsolidatedItem[]>([]);
-  const [batches, setBatches] = useState<Array<Record<string, unknown>>>([]);
+  const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingBatches, setLoadingBatches] = useState(false);
+  const [deletingBatchId, setDeletingBatchId] = useState<number | null>(null);
+  const [batchToDelete, setBatchToDelete] = useState<ImportBatch | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Excel Wizard state
@@ -118,6 +134,19 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
   const [bucketTarget, setBucketTarget] = useState<BalanceItem | null>(null);
   const [bucketForm, setBucketForm] = useState({ reviewStock: 0, damagedStock: 0, reason: '' });
 
+  const loadBatches = async () => {
+    if (currentUser.role !== UserRole.JEFE_STOCK) return;
+    setLoadingBatches(true);
+    try {
+      const bRes = await apiFetch<{ batches: ImportBatch[] }>('/api/inventory/batches');
+      setBatches(bRes.batches);
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setLoadingBatches(false);
+    }
+  };
+
   const loadData = async () => {
     setLoading(true);
     setError(null);
@@ -139,7 +168,7 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
       }
 
       if (currentUser.role === UserRole.JEFE_STOCK) {
-        const bRes = await apiFetch<{ batches: Array<Record<string, unknown>> }>('/api/inventory/batches');
+        const bRes = await apiFetch<{ batches: ImportBatch[] }>('/api/inventory/batches');
         setBatches(bRes.batches);
       }
     } catch (err: unknown) {
@@ -152,6 +181,26 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
   useEffect(() => {
     loadData();
   }, [locationId]);
+
+  const handleConfirmDeleteBatch = async () => {
+    if (!batchToDelete) return;
+    setError(null);
+    setDeletingBatchId(batchToDelete.id);
+    try {
+      await apiFetch<{ ok: boolean }>(`/api/inventory/batches/${batchToDelete.id}`, {
+        method: 'DELETE',
+      });
+      setImportSuccess(
+        `Registro de importación #${batchToDelete.id} ("${batchToDelete.filename}") eliminado. Los artículos y existencias importados se conservan intactos.`
+      );
+      setBatchToDelete(null);
+      await loadBatches();
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setDeletingBatchId(null);
+    }
+  };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -311,6 +360,20 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
             </button>
             <button
               onClick={() => {
+                setViewMode('batches');
+                loadBatches();
+              }}
+              className={`inline-flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border whitespace-nowrap transition-colors ${
+                viewMode === 'batches'
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+              }`}
+            >
+              <History className="w-3.5 h-3.5" />
+              Historial Importaciones ({batches.length})
+            </button>
+            <button
+              onClick={() => {
                 setImportStep(1);
                 setValidation(null);
                 setShowImportModal(true);
@@ -362,7 +425,10 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
           </button>
           {currentUser.role === UserRole.JEFE_STOCK && (
             <button
-              onClick={() => setViewMode('batches')}
+              onClick={() => {
+                setViewMode('batches');
+                loadBatches();
+              }}
               className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap inline-flex items-center gap-1.5 ${
                 viewMode === 'batches' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
               }`}
@@ -556,39 +622,56 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
           <table className="w-full text-xs">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 text-slate-600 text-left">
-                <th className="py-2.5 px-3">Lote</th>
-                <th className="py-2.5 px-3">Archivo</th>
-                <th className="py-2.5 px-3">Fecha Corte ERP</th>
-                <th className="py-2.5 px-3">Importado por</th>
+                <th className="py-2.5 px-3">ID</th>
+                <th className="py-2.5 px-3">Nombre del Archivo</th>
+                <th className="py-2.5 px-3">Fecha de Subida</th>
+                <th className="py-2.5 px-3">Subido por</th>
                 <th className="py-2.5 px-3 text-right">Filas</th>
-                <th className="py-2.5 px-3 text-right">Nuevos</th>
-                <th className="py-2.5 px-3 text-right">Actualizados</th>
-                <th className="py-2.5 px-3 text-right">Advertencias</th>
+                <th className="py-2.5 px-3 text-right">Nuevos / Act.</th>
+                <th className="py-2.5 px-3 text-right">Acciones</th>
               </tr>
             </thead>
             <tbody>
-              {batches.length === 0 ? (
+              {loadingBatches ? (
                 <tr>
-                  <td colSpan={8} className="py-8 text-center text-slate-500">
+                  <td colSpan={7} className="py-8 text-center text-slate-500">
+                    Cargando historial de importaciones...
+                  </td>
+                </tr>
+              ) : batches.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-8 text-center text-slate-500">
                     Aún no se registran importaciones de Excel.
                   </td>
                 </tr>
               ) : (
                 batches.map((b) => (
-                  <tr key={String(b.id)} className="border-b border-slate-100">
-                    <td className="py-2.5 px-3 font-mono font-semibold">#{String(b.id)}</td>
-                    <td className="py-2.5 px-3">{String(b.filename)}</td>
-                    <td className="py-2.5 px-3 font-mono">{String(b.cutoff_timestamp)}</td>
-                    <td className="py-2.5 px-3">{String(b.uploaded_by_name)}</td>
+                  <tr key={b.id} className="border-b border-slate-100 hover:bg-slate-50">
+                    <td className="py-2.5 px-3 font-mono font-semibold text-slate-900">#{b.id}</td>
+                    <td className="py-2.5 px-3 font-medium text-slate-900">
+                      {b.filename}
+                      <div className="text-[11px] font-mono text-slate-500">
+                        Corte ERP: {b.cutoff_timestamp ? b.cutoff_timestamp.slice(0, 16).replace('T', ' ') : '—'}
+                      </div>
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-slate-700">
+                      {b.created_at ? b.created_at.slice(0, 19).replace('T', ' ') : '—'}
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-700">{b.uploaded_by_name}</td>
                     <td className="py-2.5 px-3 text-right font-mono tabular-nums">{Number(b.total_rows)}</td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                      {Number(b.inserted_products)}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-600">
+                      +{Number(b.inserted_products)} / {Number(b.updated_balances)}
                     </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                      {Number(b.updated_balances)}
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
-                      {Number(b.warnings_count)}
+                    <td className="py-2.5 px-3 text-right">
+                      <button
+                        type="button"
+                        disabled={deletingBatchId === b.id}
+                        onClick={() => setBatchToDelete(b)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg disabled:opacity-50"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        {deletingBatchId === b.id ? 'Eliminando...' : 'Eliminar'}
+                      </button>
                     </td>
                   </tr>
                 ))
@@ -887,6 +970,47 @@ export const MasterCatalogView: React.FC<{ currentUser: AuthUser }> = ({ current
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm Delete Import Batch Modal */}
+      {batchToDelete && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="p-2 rounded-lg bg-red-50 text-red-600 shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">
+                  Eliminar Lote de Importación #{batchToDelete.id}
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5 break-all">{batchToDelete.filename}</p>
+              </div>
+            </div>
+            <p className="text-xs text-slate-700 leading-relaxed bg-amber-50 border border-amber-200 rounded-lg p-3">
+              ¿Seguro que deseas eliminar este registro de importación? Esta acción no se puede
+              deshacer. Los productos ya importados NO se borrarán.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingBatchId !== null}
+                onClick={() => setBatchToDelete(null)}
+                className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={deletingBatchId !== null}
+                onClick={handleConfirmDeleteBatch}
+                className="px-4 py-2 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg disabled:opacity-50"
+              >
+                {deletingBatchId !== null ? 'Eliminando...' : 'Confirmar Eliminación'}
+              </button>
+            </div>
           </div>
         </div>
       )}

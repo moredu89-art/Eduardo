@@ -1,10 +1,21 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Download, KeyRound, Pencil, Plus, Shield, UserCheck, UserX } from 'lucide-react';
+import {
+  CheckCircle2,
+  Download,
+  KeyRound,
+  Pencil,
+  Plus,
+  Shield,
+  Upload,
+  UserCheck,
+  UserX,
+} from 'lucide-react';
 import { apiDownload, apiFetch } from '../lib/api';
 import { AuthUser, UserRole } from '../types/erp';
 
 export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUser }) => {
-  const [tab, setTab] = useState<'users' | 'audit'>('users');
+  const isReadOnlyAudit = currentUser.role === UserRole.AUDITORIA_DIRECCION;
+  const [tab, setTab] = useState<'users' | 'audit'>(isReadOnlyAudit ? 'audit' : 'users');
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [locations, setLocations] = useState<Array<{ id: number; name: string }>>([]);
   const [availableFamilies, setAvailableFamilies] = useState<string[]>([]);
@@ -13,12 +24,28 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
   const [editTarget, setEditTarget] = useState<AuthUser | null>(null);
   const [resetTarget, setResetTarget] = useState<AuthUser | null>(null);
   const [newPassword, setNewPassword] = useState('');
+  const [restorePreview, setRestorePreview] = useState<{
+    filename: string;
+    payload: Record<string, unknown>;
+    valid: boolean;
+    errors: string[];
+    warnings: string[];
+    summary: {
+      backupVersion: number;
+      exportedAt: string;
+      totalTables: number;
+      totalRows: number;
+      attachmentFilesCount: number;
+      checksumMatch: boolean;
+    } | null;
+  } | null>(null);
+  const [restoring, setRestoring] = useState(false);
 
   const [form, setForm] = useState({
     username: '',
     fullName: '',
     email: '',
-    role: UserRole.CONTADOR,
+    role: UserRole.CONTADOR as UserRole,
     password: '',
     assignedLocationIds: [] as number[],
     assignedFamilies: [] as string[],
@@ -27,7 +54,7 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
 
   const [editForm, setEditForm] = useState({
     fullName: '',
-    role: UserRole.CONTADOR,
+    role: UserRole.CONTADOR as UserRole,
     assignedLocationIds: [] as number[],
     assignedFamilies: [] as string[],
   });
@@ -39,6 +66,11 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
   const loadData = async () => {
     setError(null);
     try {
+      if (isReadOnlyAudit) {
+        const aRes = await apiFetch<{ events: Array<Record<string, unknown>> }>('/api/audit');
+        setEvents(aRes.events);
+        return;
+      }
       const [uRes, lRes, aRes, fRes] = await Promise.all([
         apiFetch<{ users: AuthUser[] }>('/api/users'),
         apiFetch<{ locations: Array<{ id: number; name: string }> }>('/api/locations'),
@@ -71,7 +103,15 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
     try {
       await apiFetch('/api/users', {
         method: 'POST',
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          ...form,
+          assignedLocationIds:
+            form.role === UserRole.JEFE_STOCK || form.role === UserRole.AUDITORIA_DIRECCION
+              ? []
+              : form.assignedLocationIds,
+          assignedFamilies:
+            form.role === UserRole.CONTADOR ? form.assignedFamilies : [],
+        }),
       });
       setShowNewUser(false);
       setForm({
@@ -114,7 +154,9 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
           fullName: editForm.fullName,
           role: editForm.role,
           assignedLocationIds:
-            editForm.role === UserRole.JEFE_STOCK ? [] : editForm.assignedLocationIds,
+            editForm.role === UserRole.JEFE_STOCK || editForm.role === UserRole.AUDITORIA_DIRECCION
+              ? []
+              : editForm.assignedLocationIds,
           assignedFamilies:
             editForm.role === UserRole.CONTADOR ? editForm.assignedFamilies : [],
         }),
@@ -176,6 +218,71 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
     setEditCustomFamily('');
   };
 
+  const handleSelectBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setError(null);
+    setMessage(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const verifyRes = await apiFetch<{
+        valid: boolean;
+        errors: string[];
+        warnings: string[];
+        summary: {
+          backupVersion: number;
+          exportedAt: string;
+          totalTables: number;
+          totalRows: number;
+          attachmentFilesCount: number;
+          checksumMatch: boolean;
+        } | null;
+      }>('/api/admin/backup/verify', {
+        method: 'POST',
+        body: JSON.stringify(parsed),
+      });
+      setRestorePreview({
+        filename: file.name,
+        payload: parsed,
+        ...verifyRes,
+      });
+    } catch (err: unknown) {
+      setError((err as Error).message || 'No se pudo verificar el archivo de respaldo.');
+    }
+  };
+
+  const handleConfirmRestore = async () => {
+    if (!restorePreview || !restorePreview.valid) return;
+    setRestoring(true);
+    setError(null);
+    try {
+      const res = await apiFetch<{
+        restoredTables: number;
+        restoredRows: number;
+        restoredAttachmentFiles: number;
+        usersRequiringPasswordReset: string[];
+      }>('/api/admin/restore', {
+        method: 'POST',
+        body: JSON.stringify({ backup: restorePreview.payload, confirmRestore: true }),
+      });
+      setRestorePreview(null);
+      const resetNotice =
+        res.usersRequiringPasswordReset.length > 0
+          ? ` Restablezca la contraseña de los usuarios nuevos: ${res.usersRequiringPasswordReset.join(', ')}.`
+          : '';
+      setMessage(
+        `Respaldo restaurado (${res.restoredTables} tablas, ${res.restoredRows} filas, ${res.restoredAttachmentFiles} archivo(s) adjunto(s)).${resetNotice}`
+      );
+      await loadData();
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -188,27 +295,39 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() =>
-              apiDownload(
-                '/api/admin/backup',
-                `SICEP_Respaldo_${new Date().toISOString().slice(0, 10)}.json`
-              )
-            }
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 bg-white text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap"
-          >
-            <Download className="w-3.5 h-3.5" />
-            Descargar Copia de Seguridad
-          </button>
-          <button
-            onClick={() => setShowNewUser(true)}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] whitespace-nowrap"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            Nuevo Usuario
-          </button>
-        </div>
+        {!isReadOnlyAudit && (
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() =>
+                apiDownload(
+                  '/api/admin/backup',
+                  `SICEP_Respaldo_${new Date().toISOString().slice(0, 10)}.json`
+                )
+              }
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 bg-white text-slate-800 rounded-lg hover:bg-slate-50 whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Descargar Copia de Seguridad
+            </button>
+            <label className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium border border-slate-300 bg-white text-slate-800 rounded-lg hover:bg-slate-50 cursor-pointer whitespace-nowrap">
+              <Upload className="w-3.5 h-3.5" />
+              Verificar / Restaurar Respaldo
+              <input
+                type="file"
+                accept="application/json,.json"
+                onChange={handleSelectBackupFile}
+                className="hidden"
+              />
+            </label>
+            <button
+              onClick={() => setShowNewUser(true)}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-[#8e0d0d] text-white rounded-lg hover:bg-[#6e0909] whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Nuevo Usuario
+            </button>
+          </div>
+        )}
       </div>
 
       {message && (
@@ -223,14 +342,16 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
       )}
 
       <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg w-fit">
-        <button
-          onClick={() => setTab('users')}
-          className={`px-3 py-1.5 text-xs font-medium rounded-md ${
-            tab === 'users' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
-          }`}
-        >
-          Cuentas de Usuario ({users.length})
-        </button>
+        {!isReadOnlyAudit && (
+          <button
+            onClick={() => setTab('users')}
+            className={`px-3 py-1.5 text-xs font-medium rounded-md ${
+              tab === 'users' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600'
+            }`}
+          >
+            Cuentas de Usuario ({users.length})
+          </button>
+        )}
         <button
           onClick={() => setTab('audit')}
           className={`px-3 py-1.5 text-xs font-medium rounded-md ${
@@ -266,18 +387,22 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
                   <td className="py-2.5 px-3 font-medium">
                     {u.role === UserRole.JEFE_STOCK
                       ? 'Jefe de Control de Stock'
-                      : u.role === UserRole.CONTADOR
-                        ? 'Responsable de Conteo'
-                        : 'Responsable de Depósito'}
+                      : u.role === UserRole.AUDITORIA_DIRECCION
+                        ? 'Dirección / Auditoría Interna (Solo Lectura)'
+                        : u.role === UserRole.CONTADOR
+                          ? 'Responsable de Conteo'
+                          : 'Responsable de Depósito'}
                   </td>
                   <td className="py-2.5 px-3 text-slate-600">
                     {u.role === UserRole.JEFE_STOCK
                       ? 'Todos (Acceso Global)'
-                      : u.assignedLocationIds.length === 0
-                        ? 'Sin ubicaciones asignadas'
-                        : u.assignedLocationIds
-                            .map((id) => locations.find((l) => l.id === id)?.name || `#${id}`)
-                            .join(', ')}
+                      : u.role === UserRole.AUDITORIA_DIRECCION
+                        ? 'Todos (Solo Lectura Global)'
+                        : u.assignedLocationIds.length === 0
+                          ? 'Sin ubicaciones asignadas'
+                          : u.assignedLocationIds
+                              .map((id) => locations.find((l) => l.id === id)?.name || `#${id}`)
+                              .join(', ')}
                   </td>
                   <td className="py-2.5 px-3 text-slate-600">
                     {u.role === UserRole.CONTADOR
@@ -390,6 +515,9 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
                   >
                     <option value={UserRole.CONTADOR}>Responsable de Conteo</option>
                     <option value={UserRole.RESPONSABLE_DEPOSITO}>Responsable de Depósito</option>
+                    <option value={UserRole.AUDITORIA_DIRECCION}>
+                      Dirección / Auditoría Interna (Solo Lectura)
+                    </option>
                     <option value={UserRole.JEFE_STOCK}>Jefe de Control de Stock</option>
                   </select>
                 </div>
@@ -421,7 +549,13 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
                 </div>
               </div>
 
-              {form.role !== UserRole.JEFE_STOCK && (
+              {form.role === UserRole.AUDITORIA_DIRECCION && (
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700">
+                  <strong>Supervisión Ejecutiva de Solo Lectura:</strong> Acceso global al tablero de control, conteos activos por contador, planificados pendientes del mes, conteos cerrados, Almacén Maestro, ubicaciones y auditoría inmutable. No puede crear, modificar ni aprobar inventarios.
+                </div>
+              )}
+
+              {form.role !== UserRole.JEFE_STOCK && form.role !== UserRole.AUDITORIA_DIRECCION && (
                 <div>
                   <label className="block font-medium text-slate-700 mb-1">
                     Depósitos / Sucursales Asignadas
@@ -572,12 +706,21 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
                   >
                     <option value={UserRole.CONTADOR}>Responsable de Conteo</option>
                     <option value={UserRole.RESPONSABLE_DEPOSITO}>Responsable de Depósito</option>
+                    <option value={UserRole.AUDITORIA_DIRECCION}>
+                      Dirección / Auditoría Interna (Solo Lectura)
+                    </option>
                     <option value={UserRole.JEFE_STOCK}>Jefe de Control de Stock</option>
                   </select>
                 </div>
               </div>
 
-              {editForm.role !== UserRole.JEFE_STOCK && (
+              {editForm.role === UserRole.AUDITORIA_DIRECCION && (
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700">
+                  <strong>Supervisión Ejecutiva de Solo Lectura:</strong> Acceso global de lectura en todas las ubicaciones sin permisos de modificación.
+                </div>
+              )}
+
+              {editForm.role !== UserRole.JEFE_STOCK && editForm.role !== UserRole.AUDITORIA_DIRECCION && (
                 <div>
                   <label className="block font-medium text-slate-700 mb-1">
                     Depósitos / Sucursales Asignadas
@@ -736,6 +879,79 @@ export const UsersAuditView: React.FC<{ currentUser: AuthUser }> = ({ currentUse
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Backup Verification & Restore Modal */}
+      {restorePreview && (
+        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-4 text-xs">
+            <div className="flex items-center gap-2 text-base font-bold text-slate-900">
+              <CheckCircle2
+                className={`w-5 h-5 ${restorePreview.valid ? 'text-emerald-700' : 'text-red-700'}`}
+              />
+              <span>Verificación de Respaldo SICEP</span>
+            </div>
+            <div className="text-slate-600">
+              Archivo: <span className="font-mono font-semibold">{restorePreview.filename}</span>
+            </div>
+
+            {restorePreview.summary && (
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-1">
+                <div>
+                  Versión: <strong className="font-mono">v{restorePreview.summary.backupVersion}</strong> ·{' '}
+                  Exportado: <span className="font-mono">{restorePreview.summary.exportedAt.slice(0, 19)}</span>
+                </div>
+                <div>
+                  Tablas: <strong>{restorePreview.summary.totalTables}</strong> · Filas totales:{' '}
+                  <strong>{restorePreview.summary.totalRows}</strong> · Adjuntos:{' '}
+                  <strong>{restorePreview.summary.attachmentFilesCount}</strong>
+                </div>
+                <div>
+                  Integridad SHA-256:{' '}
+                  <strong className={restorePreview.summary.checksumMatch ? 'text-emerald-700' : 'text-red-700'}>
+                    {restorePreview.summary.checksumMatch ? 'Verificada' : 'Inválida'}
+                  </strong>
+                </div>
+              </div>
+            )}
+
+            {restorePreview.warnings.length > 0 && (
+              <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-amber-900">
+                {restorePreview.warnings.map((w, idx) => (
+                  <div key={idx}>{w}</div>
+                ))}
+              </div>
+            )}
+
+            {restorePreview.errors.length > 0 && (
+              <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-red-700">
+                {restorePreview.errors.map((errMsg, idx) => (
+                  <div key={idx}>{errMsg}</div>
+                ))}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setRestorePreview(null)}
+                className="px-4 py-2 border border-slate-300 rounded-lg"
+              >
+                Cerrar
+              </button>
+              {restorePreview.valid && (
+                <button
+                  type="button"
+                  disabled={restoring}
+                  onClick={handleConfirmRestore}
+                  className="px-4 py-2 bg-[#8e0d0d] text-white rounded-lg font-medium hover:bg-[#6e0909] disabled:opacity-50"
+                >
+                  {restoring ? 'Restaurando...' : 'Confirmar Restauración'}
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}

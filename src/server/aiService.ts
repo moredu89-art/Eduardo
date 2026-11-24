@@ -74,8 +74,8 @@ export async function generateExecutiveAiAnalysis(locationId?: number): Promise<
       `
       SELECT u.id, u.full_name,
         COUNT(DISTINCT c.id) as total_counts,
-        SUM(CASE WHEN c.status IN ('PROGRAMADO', 'EN_PROGRESO', 'RECONTEO_SOLICITADO') THEN 1 ELSE 0 END) as pending_counts,
-        SUM(CASE WHEN c.status IN ('VALIDADO', 'CERRADO') THEN 1 ELSE 0 END) as completed_counts
+        SUM(CASE WHEN c.status IN ('ASIGNADO', 'EN_EJECUCION', 'RECHAZADO') THEN 1 ELSE 0 END) as pending_counts,
+        SUM(CASE WHEN c.status IN ('PENDIENTE_APROBACION', 'APROBADO', 'PENDIENTE_REGULARIZACION', 'CERRADO') THEN 1 ELSE 0 END) as completed_counts
       FROM users u
       LEFT JOIN counts c ON c.assigned_counter_id = u.id
       WHERE u.role = 'CONTADOR' AND u.is_active = 1
